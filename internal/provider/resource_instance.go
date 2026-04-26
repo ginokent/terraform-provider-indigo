@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
@@ -17,7 +18,6 @@ func resourceInstance() *schema.Resource {
 	return &schema.Resource{
 		CreateContext: resourceInstanceCreate,
 		ReadContext:   resourceInstanceRead,
-		UpdateContext: resourceInstanceUpdate,
 		DeleteContext: resourceInstanceDelete,
 		Schema: map[string]*schema.Schema{
 			"name": {
@@ -47,7 +47,18 @@ func resourceInstance() *schema.Resource {
 			},
 			"status": {
 				Type:     schema.TypeString,
+				Optional: true,
 				Computed: true,
+				StateFunc: func(v any) string {
+					return strings.ToLower(v.(string))
+				},
+				ValidateFunc: func(v any, k string) (ws []string, es []error) {
+					s := strings.ToLower(v.(string))
+					if s != "running" && s != "stopped" {
+						es = append(es, fmt.Errorf("%s must be either \"running\" or \"stopped\"", k))
+					}
+					return ws, es
+				},
 			},
 			"ipv4": {
 				Type:     schema.TypeString,
@@ -93,7 +104,7 @@ func resourceInstanceRead(ctx context.Context, d *schema.ResourceData, meta any)
 	}
 
 	_ = d.Set("name", inst.Name)
-	_ = d.Set("status", inst.Status)
+	_ = d.Set("status", normalizePowerStatus(inst.Status))
 	_ = d.Set("ipv4", inst.IPv4)
 	// Indigo API sometimes returns 0 for immutable IDs even when the actual
 	// instance was created with non-zero values. Keep existing state values if
@@ -111,34 +122,6 @@ func resourceInstanceRead(ctx context.Context, d *schema.ResourceData, meta any)
 		_ = d.Set("ssh_key_id", inst.SSHPublicKey)
 	}
 	return nil
-}
-
-func resourceInstanceUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
-	c, err := apiClient(meta)
-	if err != nil {
-		return opDiag("indigo_instance", "update", err)
-	}
-
-	id, _ := strconv.Atoi(d.Id())
-	if d.HasChange("name") || d.HasChange("region_id") || d.HasChange("os_id") || d.HasChange("plan_id") || d.HasChange("ssh_key_id") {
-		// Indigo API has no update endpoint for mutable fields. Force replacement behavior.
-		return diag.Errorf("instance attributes are immutable in Indigo API; recreate the resource")
-	}
-	if d.HasChange("status") {
-		diags := diag.Diagnostics{}
-		n := d.Get("status").(string)
-		switch n {
-		case "start", "stop", "forcestop", "reset":
-			err = c.UpdateInstanceStatus(ctx, id, n)
-		default:
-			return diag.Errorf("unsupported status transition %q (allowed: start, stop, forcestop, reset)", n)
-		}
-		if err != nil {
-			diags = append(diags, opDiag("indigo_instance", "update", err)...)
-		}
-		return diags
-	}
-	return resourceInstanceRead(ctx, d, meta)
 }
 
 func resourceInstanceDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
@@ -168,6 +151,51 @@ func resourceInstanceDelete(ctx context.Context, d *schema.ResourceData, meta an
 
 	d.SetId("")
 	return nil
+}
+
+func resourceInstanceUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
+	c, err := apiClient(meta)
+	if err != nil {
+		return opDiag("indigo_instance", "update", err)
+	}
+	if !d.HasChange("status") {
+		return resourceInstanceRead(ctx, d, meta)
+	}
+
+	id, _ := strconv.Atoi(d.Id())
+	beforeRaw, afterRaw := d.GetChange("status")
+	before := normalizePowerStatus(fmt.Sprintf("%v", beforeRaw))
+	after := normalizePowerStatus(fmt.Sprintf("%v", afterRaw))
+
+	if after == "" || after == before {
+		return resourceInstanceRead(ctx, d, meta)
+	}
+
+	var command string
+	switch after {
+	case "running":
+		command = "start"
+	case "stopped":
+		command = "stop"
+	default:
+		return diag.Errorf("unsupported status %q (allowed: running, stopped)", after)
+	}
+
+	if err := c.UpdateInstanceStatus(ctx, id, command); err != nil {
+		return opDiag("indigo_instance", "update", err)
+	}
+	return resourceInstanceRead(ctx, d, meta)
+}
+
+func normalizePowerStatus(s string) string {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "running", "start":
+		return "running"
+	case "stopped", "stop", "forcestop":
+		return "stopped"
+	default:
+		return strings.ToLower(strings.TrimSpace(s))
+	}
 }
 
 func createReqFromResource(d *schema.ResourceData) client.CreateInstanceRequest {
