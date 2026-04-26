@@ -38,13 +38,13 @@ func dataSourceInstanceSpecs() *schema.Resource {
 func dataSourceInstanceSpecsRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_instance_specs", "read", err)
 	}
 	instanceTypeID := d.Get("instance_type_id").(int)
 	osID := d.Get("os_id").(int)
 	specs, err := c.ListInstanceSpecs(ctx, instanceTypeID, osID)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_instance_specs", "read", err)
 	}
 	items := make([]map[string]any, 0, len(specs))
 	for _, spec := range specs {
@@ -58,7 +58,7 @@ func dataSourceInstanceSpecsRead(ctx context.Context, d *schema.ResourceData, me
 	}
 	d.SetId("instance_specs")
 	if err := d.Set("instance_specs", items); err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_instance_specs", "read", err)
 	}
 	return nil
 }

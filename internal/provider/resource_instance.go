@@ -55,12 +55,12 @@ func resourceInstance() *schema.Resource {
 func resourceInstanceCreate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_instance", "create", err)
 	}
 
 	inst, err := c.CreateInstance(ctx, createReqFromResource(d))
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_instance", "create", err)
 	}
 	d.SetId(strconv.Itoa(inst.ID))
 
@@ -70,17 +70,17 @@ func resourceInstanceCreate(ctx context.Context, d *schema.ResourceData, meta an
 func resourceInstanceRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_instance", "read", err)
 	}
 
 	id, err := strconv.Atoi(d.Id())
 	if err != nil {
-		return diag.FromErr(fmt.Errorf("invalid id %s: %w", d.Id(), err))
+		return opDiag("indigo_instance", "read", fmt.Errorf("invalid id %s: %w", d.Id(), err))
 	}
 
 	inst, err := c.GetInstanceByID(ctx, id)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_instance", "read", err)
 	}
 	if inst == nil {
 		d.SetId("")
@@ -100,7 +100,7 @@ func resourceInstanceRead(ctx context.Context, d *schema.ResourceData, meta any)
 func resourceInstanceUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_instance", "update", err)
 	}
 
 	id, _ := strconv.Atoi(d.Id())
@@ -118,7 +118,7 @@ func resourceInstanceUpdate(ctx context.Context, d *schema.ResourceData, meta an
 			return diag.Errorf("unsupported status transition %q (allowed: start, stop, forcestop, reset)", n)
 		}
 		if err != nil {
-			diags = append(diags, diag.FromErr(err)...)
+			diags = append(diags, opDiag("indigo_instance", "update", err)...)
 		}
 		return diags
 	}
@@ -128,12 +128,12 @@ func resourceInstanceUpdate(ctx context.Context, d *schema.ResourceData, meta an
 func resourceInstanceDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_instance", "delete", err)
 	}
 
 	id, _ := strconv.Atoi(d.Id())
 	if err := c.DeleteInstance(ctx, id); err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_instance", "delete", err)
 	}
 
 	waitErr := retry.RetryContext(ctx, 2*time.Minute, func() *retry.RetryError {
@@ -147,7 +147,7 @@ func resourceInstanceDelete(ctx context.Context, d *schema.ResourceData, meta an
 		return nil
 	})
 	if waitErr != nil {
-		return diag.FromErr(waitErr)
+		return opDiag("indigo_instance", "delete", waitErr)
 	}
 
 	d.SetId("")

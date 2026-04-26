@@ -31,12 +31,12 @@ func dataSourceRegions() *schema.Resource {
 func dataSourceRegionsRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_regions", "read", err)
 	}
 	instanceTypeID := d.Get("instance_type_id").(int)
 	regions, err := c.ListRegions(ctx, instanceTypeID)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_regions", "read", err)
 	}
 	items := make([]map[string]any, 0, len(regions))
 	for _, region := range regions {
@@ -45,7 +45,7 @@ func dataSourceRegionsRead(ctx context.Context, d *schema.ResourceData, meta any
 
 	d.SetId("regions")
 	if err := d.Set("regions", items); err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_regions", "read", err)
 	}
 	return nil
 }

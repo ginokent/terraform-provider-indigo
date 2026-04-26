@@ -31,12 +31,12 @@ func dataSourceOSes() *schema.Resource {
 func dataSourceOSesRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_oses", "read", err)
 	}
 	instanceTypeID := d.Get("instance_type_id").(int)
 	oses, err := c.ListOSes(ctx, instanceTypeID)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_oses", "read", err)
 	}
 	items := make([]map[string]any, 0, len(oses))
 	for _, os := range oses {
@@ -44,7 +44,7 @@ func dataSourceOSesRead(ctx context.Context, d *schema.ResourceData, meta any) d
 	}
 	d.SetId("oses")
 	if err := d.Set("oses", items); err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_oses", "read", err)
 	}
 	return nil
 }

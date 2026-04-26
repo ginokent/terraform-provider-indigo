@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCreateAndGetInstance_WithInconsistentPayloadShapes(t *testing.T) {
@@ -30,19 +32,16 @@ func TestCreateAndGetInstance_WithInconsistentPayloadShapes(t *testing.T) {
 		})
 	})
 	mux.HandleFunc("/webarenaIndigo/v1/vm/getinstancelist", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"success": true,
-			"vms": []map[string]any{{
-				"id":            99,
-				"instance_name": "my-vm",
-				"status":        "running",
-				"region_id":     1,
-				"os_id":         22,
-				"plan_id":       13,
-				"ip":            "198.51.100.10",
-				"sshkey_id":     42,
-			}},
-		})
+		_ = json.NewEncoder(w).Encode([]map[string]any{{
+			"id":            99,
+			"instance_name": "my-vm",
+			"status":        "running",
+			"region_id":     1,
+			"os_id":         22,
+			"plan_id":       13,
+			"ip":            "198.51.100.10",
+			"sshkey_id":     42,
+		}})
 	})
 	mux.HandleFunc("/webarenaIndigo/v1/vm/instance/statusupdate", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"success": true, "sucessCode": "I20009"})
@@ -89,6 +88,118 @@ func TestAPIError_WithMessage(t *testing.T) {
 	}
 	if err.Error() == "" || !strings.Contains(err.Error(), "Invalid client credentials") {
 		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestAPIError_WithValidationErrors(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth/v1/accesstokens", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": "tok"})
+	})
+	mux.HandleFunc("/webarenaIndigo/v1/vm/sshkey", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"message": "Validation failed",
+			"errors": map[string]any{
+				"sshKey": []string{"sshKey format is invalid"},
+			},
+		})
+	})
+
+	s := httptest.NewServer(mux)
+	defer s.Close()
+
+	c := New(Config{APIKey: "k", APISecret: "s", OAuthEndpoint: s.URL + "/oauth/v1", IndigoEndpoint: s.URL + "/webarenaIndigo/v1"})
+	_, err := c.CreateSSHKey(context.Background(), "Example", "not-a-public-key")
+	if err == nil {
+		t.Fatal("expected validation error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "Validation failed") || !strings.Contains(msg, "sshKey format is invalid") {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+	if !strings.Contains(msg, "method=POST") || !strings.Contains(msg, "/vm/sshkey") {
+		t.Fatalf("missing request context in error: %v", err)
+	}
+}
+
+func TestAPIError_WithKnownLicenseFailureHint(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth/v1/accesstokens", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": "tok"})
+	})
+	mux.HandleFunc("/webarenaIndigo/v1/vm/sshkey", func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"message": "License Failed To Update.",
+			"error":   "I10037",
+		})
+	})
+
+	s := httptest.NewServer(mux)
+	defer s.Close()
+
+	c := New(Config{APIKey: "k", APISecret: "s", OAuthEndpoint: s.URL + "/oauth/v1", IndigoEndpoint: s.URL + "/webarenaIndigo/v1"})
+	_, err := c.CreateSSHKey(context.Background(), "Example", "ssh-rsa AAA")
+	if err == nil {
+		t.Fatal("expected license error")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "I10037") || !strings.Contains(msg, "hint=") {
+		t.Fatalf("expected code and hint in error: %v", err)
+	}
+}
+
+func TestListInstanceTypes_RetryOn429(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth/v1/accesstokens", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": "tok"})
+	})
+	attempt := 0
+	mux.HandleFunc("/webarenaIndigo/v1/vm/instancetypes", func(w http.ResponseWriter, r *http.Request) {
+		attempt++
+		if attempt == 1 {
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "Too Many Request"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"instanceTypes": []map[string]any{{"id": 1, "name": "KVM"}}})
+	})
+
+	s := httptest.NewServer(mux)
+	defer s.Close()
+
+	c := New(Config{APIKey: "k", APISecret: "s", OAuthEndpoint: s.URL + "/oauth/v1", IndigoEndpoint: s.URL + "/webarenaIndigo/v1"})
+	c.minInterval = 0
+
+	start := time.Now()
+	types, err := c.ListInstanceTypes(context.Background())
+	if err != nil {
+		t.Fatalf("ListInstanceTypes failed after retry: %v", err)
+	}
+	if len(types) != 1 || types[0].ID != 1 {
+		t.Fatalf("unexpected types: %#v", types)
+	}
+	if attempt != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempt)
+	}
+	if elapsed := time.Since(start); elapsed < 900*time.Millisecond {
+		t.Fatalf("expected retry-after wait, elapsed=%s", elapsed)
+	}
+}
+
+func TestRetryAfter(t *testing.T) {
+	if got := retryAfter("2"); got != 2*time.Second {
+		t.Fatalf("expected 2s, got %s", got)
+	}
+	future := time.Now().Add(2 * time.Second).UTC().Format(http.TimeFormat)
+	got := retryAfter(future)
+	if got <= 0 {
+		t.Fatalf("expected positive duration for http-date, got %s", got)
+	}
+	if got := retryAfter(strconv.Itoa(0)); got != 0 {
+		t.Fatalf("expected 0 for Retry-After: 0, got %s", got)
 	}
 }
 
@@ -170,10 +281,18 @@ func TestListOSesAndInstanceSpecs(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": "tok"})
 	})
 	mux.HandleFunc("/webarenaIndigo/v1/vm/oslist", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"oslist": []map[string]any{{"id": 22, "name": "ubuntu-22.04"}}})
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"osCategory": []map[string]any{{
+				"id":   1,
+				"name": "Ubuntu",
+				"osLists": []map[string]any{
+					{"id": 22, "name": "ubuntu-22.04"},
+				},
+			}},
+		})
 	})
 	mux.HandleFunc("/webarenaIndigo/v1/vm/getinstancespec", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"instancespec": map[string]any{"id": 13, "name": "small", "cpu": 2, "memsize": 4096, "rootdisksize": 40}})
+		_ = json.NewEncoder(w).Encode(map[string]any{"speclist": []map[string]any{{"id": 13, "name": "small", "cpu": 2, "memsize": 4096, "rootdisksize": 40}}})
 	})
 
 	s := httptest.NewServer(mux)
@@ -202,8 +321,8 @@ func TestListInstanceTypes(t *testing.T) {
 	mux.HandleFunc("/oauth/v1/accesstokens", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": "tok"})
 	})
-	mux.HandleFunc("/webarenaIndigo/v1/vm/getinstancetype", func(w http.ResponseWriter, r *http.Request) {
-		_ = json.NewEncoder(w).Encode(map[string]any{"instancetype": []map[string]any{{"id": 1, "name": "KVM"}}})
+	mux.HandleFunc("/webarenaIndigo/v1/vm/instancetypes", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"instanceTypes": []map[string]any{{"id": 1, "name": "KVM"}}})
 	})
 
 	s := httptest.NewServer(mux)

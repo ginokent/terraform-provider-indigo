@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -24,6 +25,9 @@ type Client struct {
 	indigoEndpoint string
 	apiKey         string
 	apiSecret      string
+	mu             sync.Mutex
+	lastRequestAt  time.Time
+	minInterval    time.Duration
 }
 
 type Config struct {
@@ -48,6 +52,7 @@ func New(cfg Config) *Client {
 		indigoEndpoint: indigoEndpoint,
 		apiKey:         cfg.APIKey,
 		apiSecret:      cfg.APISecret,
+		minInterval:    600 * time.Millisecond,
 	}
 }
 
@@ -69,28 +74,54 @@ func (c *Client) token(ctx context.Context) (string, error) {
 
 type APIError struct {
 	StatusCode    int
+	Method        string
+	Endpoint      string
+	Hint          string
 	Message, Body string
 }
 
 func (e *APIError) Error() string {
-	if e.Message != "" {
-		return fmt.Sprintf("api error: status=%d message=%s", e.StatusCode, e.Message)
+	base := fmt.Sprintf("api error: status=%d", e.StatusCode)
+	if e.Method != "" && e.Endpoint != "" {
+		base = fmt.Sprintf("%s method=%s endpoint=%s", base, e.Method, e.Endpoint)
 	}
-	return fmt.Sprintf("api error: status=%d", e.StatusCode)
+	if e.Message != "" {
+		if e.Hint != "" {
+			return fmt.Sprintf("%s message=%s hint=%s", base, e.Message, e.Hint)
+		}
+		return fmt.Sprintf("%s message=%s", base, e.Message)
+	}
+	if s := compactBody(e.Body, 240); s != "" {
+		if e.Hint != "" {
+			return fmt.Sprintf("%s body=%s hint=%s", base, s, e.Hint)
+		}
+		return fmt.Sprintf("%s body=%s", base, s)
+	}
+	if e.Hint != "" {
+		return fmt.Sprintf("%s hint=%s", base, e.Hint)
+	}
+	return base
 }
 
 func (c *Client) do(ctx context.Context, method, endpoint, token string, body any, out any) error {
-	var reader io.Reader
+	var payload []byte
 	if body != nil {
-		payload, err := json.Marshal(body)
+		b, err := json.Marshal(body)
 		if err != nil {
 			return fmt.Errorf("marshal payload: %w", err)
 		}
-		reader = bytes.NewReader(payload)
+		payload = b
 	}
-	var raw []byte
+	const maxAttempts = 5
 	var lastErr error
-	for attempt := 0; attempt < 3; attempt++ {
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := c.waitRateLimit(ctx); err != nil {
+			return err
+		}
+		var reader io.Reader
+		if len(payload) > 0 {
+			reader = bytes.NewReader(payload)
+		}
 		req, err := http.NewRequestWithContext(ctx, method, endpoint, reader)
 		if err != nil {
 			return err
@@ -105,29 +136,47 @@ func (c *Client) do(ctx context.Context, method, endpoint, token string, body an
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			lastErr = err
-			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+			if err := sleepWithContext(ctx, time.Duration(attempt+1)*200*time.Millisecond); err != nil {
+				return err
+			}
 			continue
 		}
-		raw, err = io.ReadAll(resp.Body)
+		raw, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
 			return err
 		}
+		apiErr := &APIError{
+			StatusCode: resp.StatusCode,
+			Method:     method,
+			Endpoint:   endpoint,
+			Body:       string(raw),
+			Message:    extractAPIErrorMessage(raw),
+		}
+		apiErr.Hint = errorHint(apiErr.StatusCode, apiErr.Message, apiErr.Body)
+
+		if resp.StatusCode == http.StatusTooManyRequests {
+			lastErr = apiErr
+			if attempt == maxAttempts-1 {
+				return apiErr
+			}
+			wait := retryAfter(resp.Header.Get("Retry-After"))
+			if wait <= 0 {
+				wait = time.Duration(attempt+1) * time.Second
+			}
+			if err := sleepWithContext(ctx, wait); err != nil {
+				return err
+			}
+			continue
+		}
 		if resp.StatusCode >= 500 {
-			lastErr = fmt.Errorf("server error %d", resp.StatusCode)
-			time.Sleep(time.Duration(attempt+1) * 200 * time.Millisecond)
+			lastErr = apiErr
+			if err := sleepWithContext(ctx, time.Duration(attempt+1)*200*time.Millisecond); err != nil {
+				return err
+			}
 			continue
 		}
 		if resp.StatusCode >= 400 {
-			apiErr := &APIError{StatusCode: resp.StatusCode, Body: string(raw)}
-			var msg struct{ Message, Error string }
-			if json.Unmarshal(raw, &msg) == nil {
-				if msg.Message != "" {
-					apiErr.Message = msg.Message
-				} else {
-					apiErr.Message = msg.Error
-				}
-			}
 			return apiErr
 		}
 		if out != nil && len(raw) > 0 {
@@ -141,6 +190,128 @@ func (c *Client) do(ctx context.Context, method, endpoint, token string, body an
 		return lastErr
 	}
 	return fmt.Errorf("request failed")
+}
+
+func (c *Client) waitRateLimit(ctx context.Context) error {
+	if c.minInterval <= 0 {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	now := time.Now()
+	if c.lastRequestAt.IsZero() {
+		c.lastRequestAt = now
+		return nil
+	}
+	next := c.lastRequestAt.Add(c.minInterval)
+	if now.Before(next) {
+		wait := next.Sub(now)
+		timer := time.NewTimer(wait)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+		now = time.Now()
+	}
+	c.lastRequestAt = now
+	return nil
+}
+
+func extractAPIErrorMessage(raw []byte) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var decoded any
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		return ""
+	}
+	values := make([]string, 0, 4)
+	collectErrorMessages(decoded, &values)
+	if len(values) == 0 {
+		return ""
+	}
+	return strings.Join(values, "; ")
+}
+
+func collectErrorMessages(v any, out *[]string) {
+	switch x := v.(type) {
+	case map[string]any:
+		foundKnown := false
+		for _, key := range []string{"message", "error", "detail", "details", "errors", "validationErrors"} {
+			if val, ok := x[key]; ok {
+				foundKnown = true
+				collectErrorMessages(val, out)
+			}
+		}
+		if !foundKnown {
+			for _, val := range x {
+				collectErrorMessages(val, out)
+			}
+		}
+	case []any:
+		for _, item := range x {
+			collectErrorMessages(item, out)
+		}
+	case string:
+		msg := strings.TrimSpace(x)
+		if msg != "" {
+			*out = append(*out, msg)
+		}
+	}
+}
+
+func compactBody(s string, limit int) string {
+	s = strings.Join(strings.Fields(strings.TrimSpace(s)), " ")
+	if len(s) <= limit {
+		return s
+	}
+	return s[:limit] + "..."
+}
+
+func errorHint(status int, message, body string) string {
+	if status == http.StatusTooManyRequests {
+		return "API rate limit exceeded. The provider retries automatically, but consider reducing parallelism (e.g. terraform apply -parallelism=1)."
+	}
+	if status == http.StatusBadRequest {
+		msg := strings.ToUpper(message + " " + body)
+		if strings.Contains(msg, "I10037") || strings.Contains(msg, "LICENSE FAILED TO UPDATE") {
+			return "Indigo account/license state may be invalid. Check contract/license status on the Indigo control panel and contact support if it persists."
+		}
+	}
+	return ""
+}
+
+func retryAfter(v string) time.Duration {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if sec, err := strconv.Atoi(v); err == nil {
+		return time.Duration(sec) * time.Second
+	}
+	if t, err := http.ParseTime(v); err == nil {
+		d := time.Until(t)
+		if d > 0 {
+			return d
+		}
+	}
+	return 0
+}
+
+func sleepWithContext(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 type SSHKey struct {
@@ -287,13 +458,11 @@ func (c *Client) GetInstanceByID(ctx context.Context, id int) (*Instance, error)
 	if err != nil {
 		return nil, err
 	}
-	var raw struct {
-		VMS any `json:"vms"`
-	}
+	var raw any
 	if err := c.do(ctx, http.MethodGet, c.indigoEndpoint+"/vm/getinstancelist", tok, nil, &raw); err != nil {
 		return nil, err
 	}
-	instances, err := decodeInstanceList(raw.VMS)
+	instances, err := decodeInstanceListFromListResponse(raw)
 	if err != nil {
 		return nil, err
 	}
@@ -327,6 +496,7 @@ func (c *Client) ListInstanceTypes(ctx context.Context) ([]InstanceType, error) 
 	}
 
 	endpoints := []string{
+		c.indigoEndpoint + "/vm/instancetypes",
 		c.indigoEndpoint + "/vm/getinstancetype",
 		c.indigoEndpoint + "/vm/getinstancetypelist",
 		c.indigoEndpoint + "/vm/instancetype",
@@ -335,9 +505,10 @@ func (c *Client) ListInstanceTypes(ctx context.Context) ([]InstanceType, error) 
 	var lastErr error
 	for _, ep := range endpoints {
 		var raw struct {
-			InstanceType any `json:"instancetype"`
-			TypeList     any `json:"typeList"`
-			TypeListAlt  any `json:"instancetypelist"`
+			InstanceTypes any `json:"instanceTypes"`
+			InstanceType  any `json:"instancetype"`
+			TypeList      any `json:"typeList"`
+			TypeListAlt   any `json:"instancetypelist"`
 		}
 		err := c.do(ctx, http.MethodGet, ep, tok, nil, &raw)
 		if err != nil {
@@ -348,7 +519,10 @@ func (c *Client) ListInstanceTypes(ctx context.Context) ([]InstanceType, error) 
 			return nil, err
 		}
 
-		candidate := raw.InstanceType
+		candidate := raw.InstanceTypes
+		if candidate == nil {
+			candidate = raw.InstanceType
+		}
 		if candidate == nil {
 			candidate = raw.TypeList
 		}
@@ -388,20 +562,52 @@ func (c *Client) ListOSes(ctx context.Context, instanceTypeID int) ([]OS, error)
 	q.Set("instanceTypeId", strconv.Itoa(instanceTypeID))
 	u.RawQuery = q.Encode()
 	var raw struct {
-		OSList any `json:"oslist"`
+		OSList     any `json:"oslist"`
+		OSCategory any `json:"osCategory"`
 	}
 	if err := c.do(ctx, http.MethodGet, u.String(), tok, nil, &raw); err != nil {
 		return nil, err
 	}
+	candidate := raw.OSList
+	if candidate == nil && raw.OSCategory != nil {
+		var categories []struct {
+			OSLists []OS `json:"osLists"`
+		}
+		if err := decodeViaMarshal(raw.OSCategory, &categories); err == nil {
+			flattened := make([]OS, 0)
+			for _, category := range categories {
+				flattened = append(flattened, category.OSLists...)
+			}
+			if len(flattened) > 0 {
+				return flattened, nil
+			}
+		}
+		candidate = raw.OSCategory
+	}
+
 	var oses []OS
-	if err := decodeViaMarshal(raw.OSList, &oses); err == nil {
+	if err := decodeViaMarshal(candidate, &oses); err == nil {
 		return oses, nil
 	}
 	var one OS
-	if err := decodeViaMarshal(raw.OSList, &one); err == nil {
+	if err := decodeViaMarshal(candidate, &one); err == nil {
 		return []OS{one}, nil
 	}
-	return nil, fmt.Errorf("unexpected oslist payload format")
+
+	var categories []struct {
+		OSLists []OS `json:"osLists"`
+	}
+	if err := decodeViaMarshal(candidate, &categories); err == nil {
+		flattened := make([]OS, 0)
+		for _, category := range categories {
+			flattened = append(flattened, category.OSLists...)
+		}
+		if len(flattened) > 0 {
+			return flattened, nil
+		}
+	}
+
+	return nil, fmt.Errorf("unexpected os list payload format")
 }
 
 type InstanceSpec struct {
@@ -425,6 +631,7 @@ func (c *Client) ListInstanceSpecs(ctx context.Context, instanceTypeID, osID int
 	var raw struct {
 		InstanceSpec any `json:"instancespec"`
 		SpecList     any `json:"specList"`
+		SpecListAlt  any `json:"speclist"`
 	}
 	if err := c.do(ctx, http.MethodGet, u.String(), tok, nil, &raw); err != nil {
 		return nil, err
@@ -432,6 +639,9 @@ func (c *Client) ListInstanceSpecs(ctx context.Context, instanceTypeID, osID int
 	candidate := raw.InstanceSpec
 	if candidate == nil {
 		candidate = raw.SpecList
+	}
+	if candidate == nil {
+		candidate = raw.SpecListAlt
 	}
 	var specs []InstanceSpec
 	if err := decodeViaMarshal(candidate, &specs); err == nil {
@@ -498,6 +708,21 @@ func decodeInstanceList(v any) ([]Instance, error) {
 		return nil, err
 	}
 	return []Instance{*one}, nil
+}
+
+func decodeInstanceListFromListResponse(v any) ([]Instance, error) {
+	if v == nil {
+		return []Instance{}, nil
+	}
+
+	var wrapped struct {
+		VMS any `json:"vms"`
+	}
+	if err := decodeViaMarshal(v, &wrapped); err == nil && wrapped.VMS != nil {
+		return decodeInstanceList(wrapped.VMS)
+	}
+
+	return decodeInstanceList(v)
 }
 func decodeViaMarshal(in any, out any) error {
 	b, err := json.Marshal(in)

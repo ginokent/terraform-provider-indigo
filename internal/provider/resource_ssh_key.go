@@ -36,11 +36,11 @@ func resourceSSHKey() *schema.Resource {
 func resourceSSHKeyCreate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_ssh_key", "create", err)
 	}
 	key, err := c.CreateSSHKey(ctx, d.Get("name").(string), d.Get("public_key").(string))
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_ssh_key", "create", err)
 	}
 	d.SetId(strconv.Itoa(key.ID))
 	return resourceSSHKeyRead(ctx, d, meta)
@@ -49,15 +49,15 @@ func resourceSSHKeyCreate(ctx context.Context, d *schema.ResourceData, meta any)
 func resourceSSHKeyRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_ssh_key", "read", err)
 	}
 	id, err := strconv.Atoi(d.Id())
 	if err != nil {
-		return diag.FromErr(fmt.Errorf("invalid id %s: %w", d.Id(), err))
+		return opDiag("indigo_ssh_key", "read", fmt.Errorf("invalid id %s: %w", d.Id(), err))
 	}
 	key, err := c.GetSSHKeyByID(ctx, id)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_ssh_key", "read", err)
 	}
 	if key == nil {
 		d.SetId("")
@@ -72,14 +72,14 @@ func resourceSSHKeyRead(ctx context.Context, d *schema.ResourceData, meta any) d
 func resourceSSHKeyUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_ssh_key", "update", err)
 	}
 	id, _ := strconv.Atoi(d.Id())
 	if !d.HasChanges("name", "public_key", "status") {
 		return resourceSSHKeyRead(ctx, d, meta)
 	}
 	if err := c.UpdateSSHKey(ctx, id, d.Get("name").(string), d.Get("public_key").(string), d.Get("status").(string)); err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_ssh_key", "update", err)
 	}
 	return resourceSSHKeyRead(ctx, d, meta)
 }
@@ -87,11 +87,11 @@ func resourceSSHKeyUpdate(ctx context.Context, d *schema.ResourceData, meta any)
 func resourceSSHKeyDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_ssh_key", "delete", err)
 	}
 	id, _ := strconv.Atoi(d.Id())
 	if err := c.DeleteSSHKey(ctx, id); err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_ssh_key", "delete", err)
 	}
 	d.SetId("")
 	return nil

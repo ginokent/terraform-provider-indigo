@@ -26,11 +26,11 @@ func dataSourceInstanceTypes() *schema.Resource {
 func dataSourceInstanceTypesRead(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_instance_types", "read", err)
 	}
 	types, err := c.ListInstanceTypes(ctx)
 	if err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_instance_types", "read", err)
 	}
 	items := make([]map[string]any, 0, len(types))
 	for _, it := range types {
@@ -38,7 +38,7 @@ func dataSourceInstanceTypesRead(ctx context.Context, d *schema.ResourceData, me
 	}
 	d.SetId("instance_types")
 	if err := d.Set("instance_types", items); err != nil {
-		return diag.FromErr(err)
+		return opDiag("indigo_instance_types", "read", err)
 	}
 	return nil
 }
