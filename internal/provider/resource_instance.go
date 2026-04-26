@@ -23,22 +23,27 @@ func resourceInstance() *schema.Resource {
 			"name": {
 				Type:     schema.TypeString,
 				Required: true,
+				ForceNew: true,
 			},
 			"region_id": {
 				Type:     schema.TypeInt,
 				Required: true,
+				ForceNew: true,
 			},
 			"os_id": {
 				Type:     schema.TypeInt,
 				Required: true,
+				ForceNew: true,
 			},
 			"plan_id": {
 				Type:     schema.TypeInt,
 				Required: true,
+				ForceNew: true,
 			},
 			"ssh_key_id": {
 				Type:     schema.TypeInt,
 				Required: true,
+				ForceNew: true,
 			},
 			"status": {
 				Type:     schema.TypeString,
@@ -90,10 +95,21 @@ func resourceInstanceRead(ctx context.Context, d *schema.ResourceData, meta any)
 	_ = d.Set("name", inst.Name)
 	_ = d.Set("status", inst.Status)
 	_ = d.Set("ipv4", inst.IPv4)
-	_ = d.Set("region_id", inst.RegionID)
-	_ = d.Set("os_id", inst.OSID)
-	_ = d.Set("plan_id", inst.PlanID)
-	_ = d.Set("ssh_key_id", inst.SSHPublicKey)
+	// Indigo API sometimes returns 0 for immutable IDs even when the actual
+	// instance was created with non-zero values. Keep existing state values if
+	// API returns zero to avoid perpetual drifts caused by upstream inconsistency.
+	if inst.RegionID > 0 {
+		_ = d.Set("region_id", inst.RegionID)
+	}
+	if inst.OSID > 0 {
+		_ = d.Set("os_id", inst.OSID)
+	}
+	if inst.PlanID > 0 {
+		_ = d.Set("plan_id", inst.PlanID)
+	}
+	if inst.SSHPublicKey > 0 {
+		_ = d.Set("ssh_key_id", inst.SSHPublicKey)
+	}
 	return nil
 }
 
