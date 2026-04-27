@@ -90,4 +90,20 @@ func TestResourceInstanceSupportsUpdate(t *testing.T) {
 	if r.Update != nil {
 		t.Fatal("resourceInstance must not set both Update and UpdateContext")
 	}
+
+	statusSchema, ok := r.Schema["status"]
+	if !ok {
+		t.Fatal("status schema must exist")
+	}
+	if !statusSchema.Computed || statusSchema.Optional {
+		t.Fatal("status must be computed-only API status")
+	}
+
+	instanceStatusSchema, ok := r.Schema["instance_status"]
+	if !ok {
+		t.Fatal("instance_status schema must exist")
+	}
+	if !instanceStatusSchema.Optional || !instanceStatusSchema.Computed {
+		t.Fatal("instance_status must be optional+computed desired/observed state")
+	}
 }

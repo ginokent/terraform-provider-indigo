@@ -51,6 +51,10 @@ func resourceInstance() *schema.Resource {
 			},
 			"status": {
 				Type:     schema.TypeString,
+				Computed: true,
+			},
+			"instance_status": {
+				Type:     schema.TypeString,
 				Optional: true,
 				Computed: true,
 				StateFunc: func(v any) string {
@@ -88,6 +92,14 @@ func resourceInstanceCreate(ctx context.Context, d *schema.ResourceData, meta an
 	}
 	d.SetId(strconv.Itoa(inst.ID))
 
+	desiredInstanceStatus := normalizePowerStatus(d.Get("instance_status").(string))
+	if desiredInstanceStatus == "stopped" {
+		id, _ := strconv.Atoi(d.Id())
+		if err := c.UpdateInstanceStatus(ctx, id, "stop"); err != nil && !isIdempotentStatusUpdateError(err, "stop") {
+			return opDiag("indigo_instance", "create", err)
+		}
+	}
+
 	return resourceInstanceRead(ctx, d, meta)
 }
 
@@ -111,16 +123,20 @@ func resourceInstanceRead(ctx context.Context, d *schema.ResourceData, meta any)
 		return nil
 	}
 
-	resolvedStatus := normalizePowerStatus(inst.Status)
+	desiredInstanceStatus := normalizePowerStatus(d.Get("instance_status").(string))
+	resolvedInstanceStatus := normalizePowerStatus(inst.Status)
 	_ = d.Set("name", inst.Name)
-	_ = d.Set("status", resolvedStatus)
-	_ = d.Set("status_raw", strings.TrimSpace(inst.RawStatus))
+	_ = d.Set("status", strings.ToLower(strings.TrimSpace(inst.APIStatus)))
+	if desiredInstanceStatus == "" {
+		_ = d.Set("instance_status", resolvedInstanceStatus)
+	}
 	_ = d.Set("ipv4", inst.IPv4)
 	tflog.Debug(ctx, "resolved instance power status", map[string]any{
-		"id":                d.Id(),
-		"remote_status":     strings.TrimSpace(inst.Status),
-		"remote_status_raw": strings.TrimSpace(inst.RawStatus),
-		"resolved_status":   resolvedStatus,
+		"id":                       d.Id(),
+		"desired_instance_status":  desiredInstanceStatus,
+		"observed_instance_status": strings.TrimSpace(inst.Status),
+		"api_status":               strings.TrimSpace(inst.APIStatus),
+		"resolved_instance_status": resolvedInstanceStatus,
 	})
 	// Indigo API sometimes returns 0 for immutable IDs even when the actual
 	// instance was created with non-zero values. Keep existing state values if
@@ -174,12 +190,12 @@ func resourceInstanceUpdate(ctx context.Context, d *schema.ResourceData, meta an
 	if err != nil {
 		return opDiag("indigo_instance", "update", err)
 	}
-	if !d.HasChange("status") {
+	if !d.HasChange("instance_status") {
 		return resourceInstanceRead(ctx, d, meta)
 	}
 
 	id, _ := strconv.Atoi(d.Id())
-	beforeRaw, afterRaw := d.GetChange("status")
+	beforeRaw, afterRaw := d.GetChange("instance_status")
 	before := normalizePowerStatus(fmt.Sprintf("%v", beforeRaw))
 	after := normalizePowerStatus(fmt.Sprintf("%v", afterRaw))
 

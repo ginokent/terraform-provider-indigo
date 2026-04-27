@@ -231,18 +231,22 @@ func TestInstanceUnmarshal_UsesInstanceStatusWhenPresent(t *testing.T) {
 		"region_id": 1,
 		"os_id": 25,
 		"plan_id": 3,
-		"ip": "116.80.48.236",
+		"ipaddress": "116.80.48.236",
+		"ip": "198.51.100.10",
 		"sshkey_id": 45985
 	}`)
 
 	if err := json.Unmarshal(payload, &inst); err != nil {
 		t.Fatalf("unmarshal instance failed: %v", err)
 	}
-	if inst.RawStatus != "OPEN" {
-		t.Fatalf("RawStatus = %q, want OPEN", inst.RawStatus)
+	if inst.APIStatus != "OPEN" {
+		t.Fatalf("APIStatus = %q, want OPEN", inst.APIStatus)
 	}
 	if inst.Status != "Running" {
 		t.Fatalf("Status = %q, want Running", inst.Status)
+	}
+	if inst.IPv4 != "116.80.48.236" {
+		t.Fatalf("IPv4 = %q, want 116.80.48.236", inst.IPv4)
 	}
 }
 
