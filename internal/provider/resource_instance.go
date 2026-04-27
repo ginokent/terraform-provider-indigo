@@ -18,6 +18,7 @@ func resourceInstance() *schema.Resource {
 	return &schema.Resource{
 		CreateContext: resourceInstanceCreate,
 		ReadContext:   resourceInstanceRead,
+		UpdateContext: resourceInstanceUpdate,
 		DeleteContext: resourceInstanceDelete,
 		Schema: map[string]*schema.Schema{
 			"name": {
@@ -189,9 +190,9 @@ func resourceInstanceUpdate(ctx context.Context, d *schema.ResourceData, meta an
 
 func normalizePowerStatus(s string) string {
 	switch strings.ToLower(strings.TrimSpace(s)) {
-	case "running", "start":
+	case "running", "start", "active", "ready":
 		return "running"
-	case "stopped", "stop", "forcestop":
+	case "stopped", "stop", "forcestop", "close", "closed", "open":
 		return "stopped"
 	default:
 		return strings.ToLower(strings.TrimSpace(s))
