@@ -418,11 +418,11 @@ func (k *SSHKey) UnmarshalJSON(data []byte) error {
 }
 
 type Instance struct {
-	ID                     int
-	Name, Status           string
-	RegionID, OSID, PlanID int
-	IPv4                   string
-	SSHPublicKey           int
+	ID                      int
+	Name, Status, RawStatus string
+	RegionID, OSID, PlanID  int
+	IPv4                    string
+	SSHPublicKey            int
 }
 
 type CreateInstanceRequest struct {
@@ -734,19 +734,26 @@ func decodeViaMarshal(in any, out any) error {
 
 func (i *Instance) UnmarshalJSON(data []byte) error {
 	type alias struct {
-		ID           int    `json:"id"`
-		Name         string `json:"instance_name"`
-		Status       string `json:"status"`
-		RegionID     int    `json:"region_id"`
-		OSID         int    `json:"os_id"`
-		PlanID       int    `json:"plan_id"`
-		IPv4         string `json:"ip"`
-		SSHPublicKey int    `json:"sshkey_id"`
+		ID             int    `json:"id"`
+		Name           string `json:"instance_name"`
+		Status         string `json:"status"`
+		InstanceStatus string `json:"instancestatus"`
+		RegionID       int    `json:"region_id"`
+		OSID           int    `json:"os_id"`
+		PlanID         int    `json:"plan_id"`
+		IPv4           string `json:"ip"`
+		SSHPublicKey   int    `json:"sshkey_id"`
 	}
 	var a alias
 	if err := json.Unmarshal(data, &a); err != nil {
 		return err
 	}
-	i.ID, i.Name, i.Status, i.RegionID, i.OSID, i.PlanID, i.IPv4, i.SSHPublicKey = a.ID, a.Name, a.Status, a.RegionID, a.OSID, a.PlanID, a.IPv4, a.SSHPublicKey
+	i.ID, i.Name, i.RegionID, i.OSID, i.PlanID, i.IPv4, i.SSHPublicKey = a.ID, a.Name, a.RegionID, a.OSID, a.PlanID, a.IPv4, a.SSHPublicKey
+	i.RawStatus = a.Status
+	if strings.TrimSpace(a.InstanceStatus) != "" {
+		i.Status = a.InstanceStatus
+	} else {
+		i.Status = a.Status
+	}
 	return nil
 }

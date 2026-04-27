@@ -221,6 +221,31 @@ func TestGetInstanceByID_BadJSON(t *testing.T) {
 	}
 }
 
+func TestInstanceUnmarshal_UsesInstanceStatusWhenPresent(t *testing.T) {
+	var inst Instance
+	payload := []byte(`{
+		"id": 779400,
+		"instance_name": "tf-indigo-vm",
+		"status": "OPEN",
+		"instancestatus": "Running",
+		"region_id": 1,
+		"os_id": 25,
+		"plan_id": 3,
+		"ip": "116.80.48.236",
+		"sshkey_id": 45985
+	}`)
+
+	if err := json.Unmarshal(payload, &inst); err != nil {
+		t.Fatalf("unmarshal instance failed: %v", err)
+	}
+	if inst.RawStatus != "OPEN" {
+		t.Fatalf("RawStatus = %q, want OPEN", inst.RawStatus)
+	}
+	if inst.Status != "Running" {
+		t.Fatalf("Status = %q, want Running", inst.Status)
+	}
+}
+
 func TestSSHKeyCRUD_WithArrayAndObjectShapes(t *testing.T) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/oauth/v1/accesstokens", func(w http.ResponseWriter, r *http.Request) {

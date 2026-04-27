@@ -2,11 +2,14 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/hashicorp/terraform-plugin-log/tflog"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -61,6 +64,10 @@ func resourceInstance() *schema.Resource {
 					return ws, es
 				},
 			},
+			"status_raw": {
+				Type:     schema.TypeString,
+				Computed: true,
+			},
 			"ipv4": {
 				Type:     schema.TypeString,
 				Computed: true,
@@ -104,9 +111,17 @@ func resourceInstanceRead(ctx context.Context, d *schema.ResourceData, meta any)
 		return nil
 	}
 
+	resolvedStatus := normalizePowerStatus(inst.Status)
 	_ = d.Set("name", inst.Name)
-	_ = d.Set("status", normalizePowerStatus(inst.Status))
+	_ = d.Set("status", resolvedStatus)
+	_ = d.Set("status_raw", strings.TrimSpace(inst.RawStatus))
 	_ = d.Set("ipv4", inst.IPv4)
+	tflog.Debug(ctx, "resolved instance power status", map[string]any{
+		"id":                d.Id(),
+		"remote_status":     strings.TrimSpace(inst.Status),
+		"remote_status_raw": strings.TrimSpace(inst.RawStatus),
+		"resolved_status":   resolvedStatus,
+	})
 	// Indigo API sometimes returns 0 for immutable IDs even when the actual
 	// instance was created with non-zero values. Keep existing state values if
 	// API returns zero to avoid perpetual drifts caused by upstream inconsistency.
@@ -183,6 +198,9 @@ func resourceInstanceUpdate(ctx context.Context, d *schema.ResourceData, meta an
 	}
 
 	if err := c.UpdateInstanceStatus(ctx, id, command); err != nil {
+		if isIdempotentStatusUpdateError(err, command) {
+			return resourceInstanceRead(ctx, d, meta)
+		}
 		return opDiag("indigo_instance", "update", err)
 	}
 	return resourceInstanceRead(ctx, d, meta)
@@ -196,6 +214,22 @@ func normalizePowerStatus(s string) string {
 		return "stopped"
 	default:
 		return strings.ToLower(strings.TrimSpace(s))
+	}
+}
+
+func isIdempotentStatusUpdateError(err error, command string) bool {
+	var apiErr *client.APIError
+	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
+		return false
+	}
+	msg := strings.ToLower(strings.TrimSpace(apiErr.Message + " " + apiErr.Body))
+	switch command {
+	case "start":
+		return strings.Contains(msg, "already running")
+	case "stop":
+		return strings.Contains(msg, "already stopped") || strings.Contains(msg, "already stop")
+	default:
+		return false
 	}
 }
 
