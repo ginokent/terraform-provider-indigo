@@ -15,11 +15,6 @@ variable "instance_name" {
   default     = "tf-indigo-vm"
 }
 
-variable "region_id" {
-  type        = number
-  description = "Region ID"
-}
-
 variable "os_id" {
   type        = number
   description = "OS ID"

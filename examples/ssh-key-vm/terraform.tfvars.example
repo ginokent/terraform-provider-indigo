@@ -1,7 +1,8 @@
 # Copy this file to terraform.tfvars and adjust values
-ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC... user@example"
 
-region_id = 1
+# ssh public key can't have a comment
+ssh_public_key = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC..."
+
 os_id     = 25 # Ubuntu 24.04
 plan_id   = 3  # Memory4GB,4vCPU,SSD80GB
 

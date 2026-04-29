@@ -20,7 +20,7 @@ resource "indigo_ssh_key" "this" {
 
 resource "indigo_instance" "vm" {
   name       = var.instance_name
-  region_id  = var.region_id
+  region_id  = 1
   os_id      = var.os_id
   plan_id    = var.plan_id
   ssh_key_id = tonumber(indigo_ssh_key.this.id)
