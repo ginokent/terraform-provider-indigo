@@ -3,7 +3,7 @@ package main
 import (
 	"github.com/hashicorp/terraform-plugin-sdk/v2/plugin"
 
-	"github.com/example/terraform-provider-webarena-indigo/internal/provider"
+	"github.com/ginokent/terraform-provider-indigo/internal/provider"
 )
 
 func main() {

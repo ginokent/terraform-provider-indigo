@@ -1,4 +1,4 @@
-module github.com/example/terraform-provider-webarena-indigo
+module github.com/ginokent/terraform-provider-indigo
 
 go 1.24.0
 

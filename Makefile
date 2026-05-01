@@ -9,17 +9,23 @@ ARCH ?= $(shell go env GOARCH)
 PLUGIN_BASE ?= $(HOME)/.terraform.d/plugins/registry.terraform.io/local/$(PROVIDER_NAME)/$(VERSION)/$(OS)_$(ARCH)
 PLUGIN_BIN := $(PLUGIN_BASE)/$(BINARY_NAME)_v$(VERSION)
 
-.PHONY: deps build install test test-client clean
+.DEFAULT_GOAL := help
+.PHONY: help
+help:  ## Display this help documents
+	@grep -E '^[0-9a-zA-Z_-]+:.*?## .*$$' ${MAKEFILE_LIST} | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-40s\033[0m %s\n", $$1, $$2}'
 
-deps:
+.PHONY: deps
+deps: ## Download dependencies
 	go mod download
 
-build: deps
-	go build -o bin/$(BINARY_NAME) ./main
+.PHONY: build
+build: deps ## Build the binary
+	go build -o bin/$(BINARY_NAME) .
 
-install: deps
+.PHONY: install
+install: deps ## Install the plugin
 	@mkdir -p $(PLUGIN_BASE)
-	go build -o $(PLUGIN_BIN) ./main
+	go build -o $(PLUGIN_BIN) .
 	@echo "Installed: $(PLUGIN_BIN)"
 	@echo
 	@echo "Use in Terraform:"
@@ -43,11 +49,14 @@ install: deps
 	@echo '  }'
 	@echo '}'
 
-test:
+.PHONY: test
+test: ## Run tests
 	go test ./...
 
-test-client:
+.PHONY: test-client
+test-client: ## Run client tests
 	go test ./internal/client
 
-clean:
+.PHONY: clean
+clean: ## Clean the binary and plugin
 	rm -rf bin/

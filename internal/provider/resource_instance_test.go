@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/example/terraform-provider-webarena-indigo/internal/client"
+	"github.com/ginokent/terraform-provider-indigo/internal/client"
 )
 
 func TestNormalizePowerStatus(t *testing.T) {

@@ -14,7 +14,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/retry"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 
-	"github.com/example/terraform-provider-webarena-indigo/internal/client"
+	"github.com/ginokent/terraform-provider-indigo/internal/client"
 )
 
 func resourceInstance() *schema.Resource {
