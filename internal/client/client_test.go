@@ -20,27 +20,28 @@ func TestCreateAndGetInstance_WithInconsistentPayloadShapes(t *testing.T) {
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"success": true,
 			"vms": map[string]any{
-				"id":            99,
-				"instance_name": "my-vm",
-				"status":        "READY",
-				"region_id":     1,
-				"os_id":         22,
-				"plan_id":       13,
-				"ip":            "198.51.100.10",
-				"sshkey_id":     42,
+				"id":             99,
+				"instance_name":  "my-vm",
+				"status":         "READY",
+				"instancestatus": "OS installation In Progress",
+				"os_id":          22,
+				"plan_id":        13,
+				"ip":             "198.51.100.10",
+				"sshkey_id":      42,
 			},
 		})
 	})
 	mux.HandleFunc("/webarenaIndigo/v1/vm/getinstancelist", func(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode([]map[string]any{{
-			"id":            99,
-			"instance_name": "my-vm",
-			"status":        "running",
-			"region_id":     1,
-			"os_id":         22,
-			"plan_id":       13,
-			"ip":            "198.51.100.10",
-			"sshkey_id":     42,
+			"id":             99,
+			"instance_name":  "my-vm",
+			"status":         "OPEN",
+			"instancestatus": "Running",
+			"os_id":          22,
+			"plan_id":        13,
+			"ipaddress":      "198.51.100.10",
+			"ip":             "198.51.100.10",
+			"sshkey_id":      42,
 		}})
 	})
 	mux.HandleFunc("/webarenaIndigo/v1/vm/instance/statusupdate", func(w http.ResponseWriter, r *http.Request) {
@@ -63,8 +64,14 @@ func TestCreateAndGetInstance_WithInconsistentPayloadShapes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetInstanceByID failed: %v", err)
 	}
-	if got == nil || got.Status != "running" {
-		t.Fatalf("unexpected instance payload: %#v", got)
+	if got == nil {
+		t.Fatal("GetInstanceByID returned nil instance")
+	}
+	if got.LifecycleStatus != "OPEN" {
+		t.Fatalf("LifecycleStatus = %q, want OPEN", got.LifecycleStatus)
+	}
+	if got.PowerStatus != "Running" {
+		t.Fatalf("PowerStatus = %q, want Running", got.PowerStatus)
 	}
 
 	if err := c.UpdateInstanceStatus(context.Background(), 99, "stop"); err != nil {
@@ -221,14 +228,13 @@ func TestGetInstanceByID_BadJSON(t *testing.T) {
 	}
 }
 
-func TestInstanceUnmarshal_UsesInstanceStatusWhenPresent(t *testing.T) {
+func TestInstanceUnmarshal_SeparatesLifecycleAndPower(t *testing.T) {
 	var inst Instance
 	payload := []byte(`{
 		"id": 779400,
 		"instance_name": "tf-indigo-vm",
 		"status": "OPEN",
 		"instancestatus": "Running",
-		"region_id": 1,
 		"os_id": 25,
 		"plan_id": 3,
 		"ipaddress": "116.80.48.236",
@@ -239,14 +245,38 @@ func TestInstanceUnmarshal_UsesInstanceStatusWhenPresent(t *testing.T) {
 	if err := json.Unmarshal(payload, &inst); err != nil {
 		t.Fatalf("unmarshal instance failed: %v", err)
 	}
-	if inst.APIStatus != "OPEN" {
-		t.Fatalf("APIStatus = %q, want OPEN", inst.APIStatus)
+	if inst.LifecycleStatus != "OPEN" {
+		t.Fatalf("LifecycleStatus = %q, want OPEN", inst.LifecycleStatus)
 	}
-	if inst.Status != "Running" {
-		t.Fatalf("Status = %q, want Running", inst.Status)
+	if inst.PowerStatus != "Running" {
+		t.Fatalf("PowerStatus = %q, want Running", inst.PowerStatus)
 	}
+	// ipaddress を優先し、ip は使われない
 	if inst.IPv4 != "116.80.48.236" {
 		t.Fatalf("IPv4 = %q, want 116.80.48.236", inst.IPv4)
+	}
+}
+
+// instancestatus が空 / 存在しない場合に LifecycleStatus が PowerStatus へ漏れないことを確認する
+// (既存コードに存在した混同のリグレッション防止)。
+func TestInstanceUnmarshal_PowerEmptyWhenInstanceStatusMissing(t *testing.T) {
+	var inst Instance
+	payload := []byte(`{
+		"id": 1,
+		"instance_name": "no-instancestatus",
+		"status": "OPEN",
+		"os_id": 25,
+		"plan_id": 3
+	}`)
+
+	if err := json.Unmarshal(payload, &inst); err != nil {
+		t.Fatalf("unmarshal failed: %v", err)
+	}
+	if inst.LifecycleStatus != "OPEN" {
+		t.Fatalf("LifecycleStatus = %q, want OPEN", inst.LifecycleStatus)
+	}
+	if inst.PowerStatus != "" {
+		t.Fatalf("PowerStatus = %q, want empty (must NOT fall back to LifecycleStatus)", inst.PowerStatus)
 	}
 }
 

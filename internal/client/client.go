@@ -435,12 +435,22 @@ func (k *SSHKey) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
+// Instance は Indigo の VM 情報を表す。
+//
+// LifecycleStatus と PowerStatus は別概念であり混同してはいけない:
+//   - LifecycleStatus (API: "status")  : リソース管理面の状態。観測値は "READY" (provisioning 中) / "OPEN" (provisioning 完了)
+//   - PowerStatus     (API: "instancestatus"): VM の電源/動作状態。観測値は "Running" / "Stopped" / "OS installation In Progress" 等
+//
+// API は Region ID を返さない (regionname だけ返してくる) ため、構造体にも持たない。
+// Region ID はユーザが create 時に与える immutable な入力で、Terraform state 側で保持する。
 type Instance struct {
-	ID                      int
-	Name, Status, APIStatus string
-	RegionID, OSID, PlanID  int
-	IPv4                    string
-	SSHPublicKey            int
+	ID              int
+	Name            string
+	LifecycleStatus string
+	PowerStatus     string
+	OSID, PlanID    int
+	IPv4            string
+	SSHKeyID        int
 }
 
 type CreateInstanceRequest struct {
@@ -734,20 +744,6 @@ func decodeInstanceList(v any) ([]Instance, error) {
 	return []Instance{*one}, nil
 }
 
-func decodeInstanceListFromListResponse(v any) ([]Instance, error) {
-	if v == nil {
-		return []Instance{}, nil
-	}
-
-	var wrapped struct {
-		VMS any `json:"vms"`
-	}
-	if err := decodeViaMarshal(v, &wrapped); err == nil && wrapped.VMS != nil {
-		return decodeInstanceList(wrapped.VMS)
-	}
-
-	return decodeInstanceList(v)
-}
 // decodeViaMarshal は any (json.Unmarshal で得た map/slice) を out の型に再アサインするためのユーティリティ。
 // Indigo はレスポンス shape が一定でない (key 名/object-array) ため、いったん any で受けてから
 // 候補の Go 型に対し Marshal→Unmarshal を試行する方針を採っている。
@@ -762,17 +758,17 @@ func decodeViaMarshal(in any, out any) error {
 // UnmarshalJSON は Indigo の Instance レスポンスを正規化する。
 //
 // 手書きしている理由:
-//   - 電源状態は "instancestatus" (typo されたキー) に入り、API ステータスは "status" に入るが、
-//     environment によって instancestatus が欠落することがあるため Status のフォールバック先として status を使う
-//   - IP は "ipaddress" もしくは "ip" のどちらかで返ってくるため両方を見て、優先順位は ipaddress
-//   - APIStatus は API のレスポンスステータス (例: "Success" / "Failed") を保持するため別フィールドに分けている
+//   - lifecycle ("status") と power ("instancestatus") は **別概念であり、絶対に混同しない**。
+//     どちらか一方が空でももう一方の値を流用してはならない。
+//   - IP は "ipaddress" と "ip" の両方が同時に存在することがある (片方が "" や null のことも)。
+//     優先順位は ipaddress、空なら ip にフォールバック。
+//   - region_id は API レスポンスに存在しない (`regionname` のみ) ため受け取らない。
 func (i *Instance) UnmarshalJSON(data []byte) error {
 	type apiInstance struct {
 		ID             int    `json:"id"`
 		InstanceName   string `json:"instance_name"`
-		Status         string `json:"status"`
-		InstanceStatus string `json:"instancestatus"`
-		RegionID       int    `json:"region_id"`
+		Status         string `json:"status"`         // lifecycle: READY / OPEN
+		InstanceStatus string `json:"instancestatus"` // power: Running / Stopped / 遷移中文字列
 		OSID           int    `json:"os_id"`
 		PlanID         int    `json:"plan_id"`
 		IPAddress      string `json:"ipaddress"`
@@ -787,12 +783,13 @@ func (i *Instance) UnmarshalJSON(data []byte) error {
 	if ipv4 == "" {
 		ipv4 = strings.TrimSpace(a.IP)
 	}
-	i.ID, i.Name, i.RegionID, i.OSID, i.PlanID, i.IPv4, i.SSHPublicKey = a.ID, a.InstanceName, a.RegionID, a.OSID, a.PlanID, ipv4, a.SSHKeyID
-	i.APIStatus = a.Status
-	if strings.TrimSpace(a.InstanceStatus) != "" {
-		i.Status = a.InstanceStatus
-	} else {
-		i.Status = a.Status
-	}
+	i.ID = a.ID
+	i.Name = a.InstanceName
+	i.LifecycleStatus = a.Status
+	i.PowerStatus = a.InstanceStatus
+	i.OSID = a.OSID
+	i.PlanID = a.PlanID
+	i.IPv4 = ipv4
+	i.SSHKeyID = a.SSHKeyID
 	return nil
 }

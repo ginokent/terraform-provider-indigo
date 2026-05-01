@@ -9,18 +9,17 @@ import (
 
 func TestNormalizePowerStatus(t *testing.T) {
 	cases := map[string]string{
-		"running":   "running",
-		"RUNNING":   "running",
-		"Running":   "running",
-		"start":     "running",
-		"open":      "stopped",
-		"active":    "running",
-		"ready":     "running",
-		"stopped":   "stopped",
-		"Stopped":   "stopped",
-		"STOP":      "stopped",
-		"forcestop": "stopped",
-		"closed":    "stopped",
+		// 実 API で観測される power 値 (case-insensitive)
+		"Running": "running",
+		"running": "running",
+		"RUNNING": "running",
+		"Stopped": "stopped",
+		"stopped": "stopped",
+		"STOPPED": "stopped",
+		// 遷移中文字列はそのまま (lowercased+trimmed)
+		"OS installation In Progress": "os installation in progress",
+		"  Running  ":                 "running",
+		"":                            "",
 	}
 	for in, want := range cases {
 		if got := normalizePowerStatus(in); got != want {

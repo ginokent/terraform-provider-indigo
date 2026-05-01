@@ -23,29 +23,49 @@ Indigo API には次のような問題が観測されており、provider/client
 
 - **レスポンス shape の揺れ**: 同じ概念に対して環境ごとに object / array / 別キー名で返ってくる
   - 対処: `decodeViaMarshal` で any → 候補型へ Marshal/Unmarshal を試行 (`internal/client/client.go`)
-- **キー名の表記揺れ・typo**: `instanceTypes` / `instancetype` / `typeList` / `instancetypelist` / `instancestatus` / `ipaddress` vs `ip` 等
-  - 対処: raw 構造体に複数候補キーを並べる、`Instance.UnmarshalJSON` で fallback
+- **キー名の表記揺れ**: `instanceTypes` / `instancetype` / `typeList` / `instancetypelist` / `ipaddress` vs `ip` 等、同概念で複数の名前が混在
+  - 対処: raw 構造体に複数候補キーを並べ、非 nil の最初を採用 (`Instance.UnmarshalJSON` 等)
 - **API path の揺れ**: ドキュメントとデプロイで instance type 取得の path が一致しない
   - 対処: `ListInstanceTypes` で endpoint 候補を順に試行し 404 をスキップ
 - **冪等性の欠如**: `start`/`stop` が「既に running/stopped」の状態で 400 を返す
   - 対処: `isIdempotentStatusUpdateError` で成功扱いに変換
 - **DELETE 専用 endpoint が存在しない**: インスタンス削除は `statusupdate` の `destroy` コマンド経由
   - 対処: `client.DeleteInstance` がそれをカプセル化、`resourceInstanceDelete` は 2 分間ポーリングして消滅確認
-- **不変フィールドが 0 で返る既知バグ**: `region_id` / `os_id` / `plan_id` / `ssh_key_id` が 0 で返ることがある
+- **一部 ID が 0 で返る場合がある**: `os_id` / `plan_id` / `sshkey_id` が稀に 0 で返るレース条件
   - 対処: `resourceInstanceRead` で 0 値は state を維持 (perpetual drift 回避)
 - **エラーレスポンスの shape 揺れ**: `{message:...}` / `{errors:[{detail:...}]}` / `{validationErrors:{...}}` 等
   - 対処: `extractAPIErrorMessage` の再帰探索
 
-### 3. ステータス概念を Terraform 上で 2 軸に分離する
+### 3. ステータス概念を 2 軸 (lifecycle / power) として明確に分離する
 
-Indigo は単一の `status` フィールドに「電源状態」と「API 応答ステータス」を混在させてくる。Terraform の resource では明確に分離する。
+Indigo API は instance に対して **2 つの別概念のフィールド** を返す。これを混同してはいけない (旧実装は混同しており、provisioning 完了状態 `OPEN` を power の "stopped" にマップする等の不整合があった)。
 
-- `instance_status` (Optional+Computed): ユーザが指示する電源状態。`running` / `stopped` のみ受理
-- `status` (Computed): API 応答ステータスを小文字化した読み取り値
-- `status_raw` (Computed): 生の status 文字列 (debug 用)
-- `normalizePowerStatus` で Indigo が返す多様な文字列 (`active`/`ready`/`forcestop`/`close`/`open` 等) を 2 値に正規化
+| 概念 | API field | 観測値 | Go (Instance struct) | Terraform schema |
+|---|---|---|---|---|
+| lifecycle (リソース管理面) | `status` | `READY` (provisioning 中) → `OPEN` (provisioning 完了) | `LifecycleStatus` | `status` (Computed) |
+| power (VM の電源状態) | `instancestatus` | `Running` / `Stopped` / `OS installation In Progress` 等 | `PowerStatus` | `instance_status` (Optional+Computed)、`status_raw` (Computed: 生値) |
 
-### 4. 後方互換性は考慮しない
+- `Instance.UnmarshalJSON` は両者を **独立に** 設定する。片方が空でももう一方の値を流用しない
+- `normalizePowerStatus` は power 専用。観測実値 `Running` / `Stopped` のみマップし、それ以外 (遷移中文字列など) は lowercased+trimmed で素通し
+- `instance_status` はユーザ入力としては `running` / `stopped` のみ受理 (ValidateFunc)
+
+### 4. インスタンスの provisioning 完了と power 収束を Create / Update で待ち合わせる
+
+Indigo は create 後に **provisioning → 自動 boot → 自動停止** という遷移を自動で行い、ユーザが触れる状態 (`status=OPEN` / `instancestatus=Stopped`) になる。
+
+- `resourceInstanceCreate`: createinstance → `LifecycleStatus=OPEN` までポーリング (15 分) → desired が running なら `start` を発行し `PowerStatus=Running` まで待つ (5 分)
+- `resourceInstanceUpdate`: start/stop 発行後に `PowerStatus` が desired に収束するまで待つ (5 分)
+- `resourceInstanceRead`: 観測値を **常に** state へ書き戻す。desired を理由に上書きを抑止しない (drift を terraform に検出させるため)
+
+### 5. region_id は API レスポンスに含まれない前提で扱う
+
+`getinstancelist` 等のレスポンスは `regionname` (文字列) のみを返し、`region_id` (数値) は返さない。Terraform 側では:
+
+- `Instance` 構造体に `RegionID` フィールドを **持たない**
+- `region_id` schema は `Required` + `ForceNew`。create 時にユーザが与えた値が state に保持される
+- `resourceInstanceRead` は `region_id` を API から復元しない (そもそもデータがない)
+
+### 6. 後方互換性は考慮しない
 
 セマンティクスのクリーンさを優先する。fallback / 互換 shim を入れない。
 
