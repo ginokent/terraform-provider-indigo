@@ -46,14 +46,15 @@ Indigo API は instance に対して **2 つの別概念のフィールド** を
 | power (VM の電源状態) | `instancestatus` | `Running` / `Stopped` / `OS installation In Progress` 等 | `PowerStatus` | `instance_status` (Optional+Computed)、`status_raw` (Computed: 生値) |
 
 - `Instance.UnmarshalJSON` は両者を **独立に** 設定する。片方が空でももう一方の値を流用しない
-- `normalizePowerStatus` は power 専用。観測実値 `Running` / `Stopped` のみマップし、それ以外 (遷移中文字列など) は lowercased+trimmed で素通し
-- `instance_status` はユーザ入力としては `running` / `stopped` のみ受理 (ValidateFunc)
+- `normalizePowerStatus` は power 専用。観測実値 `Running` / `Stopped` を enum 値 `RUNNING` / `STOPPED` に正規化し、それ以外 (遷移中文字列など) は uppercased+trimmed で素通し
+- `instance_status` はユーザ入力としては `RUNNING` / `STOPPED` のみ受理 (ValidateFunc)。case-insensitive で受けて UPPER_CASE で state に保存 (StateFunc)
+- `status` (lifecycle) も同様に UPPER_CASE で state に保存 (`READY` / `OPEN`)
 
 ### 4. インスタンスの provisioning 完了と power 収束を Create / Update で待ち合わせる
 
 Indigo は create 後に **provisioning → 自動 boot → 自動停止** という遷移を自動で行い、ユーザが触れる状態 (`status=OPEN` / `instancestatus=Stopped`) になる。
 
-- `resourceInstanceCreate`: createinstance → `LifecycleStatus=OPEN` までポーリング (15 分) → desired が running なら `start` を発行し `PowerStatus=Running` まで待つ (5 分)
+- `resourceInstanceCreate`: createinstance → `LifecycleStatus=OPEN` までポーリング (15 分) → desired が `RUNNING` なら `start` を発行し power が `RUNNING` まで収束するのを待つ (5 分)
 - `resourceInstanceUpdate`: start/stop 発行後に `PowerStatus` が desired に収束するまで待つ (5 分)
 - `resourceInstanceRead`: 観測値を **常に** state へ書き戻す。desired を理由に上書きを抑止しない (drift を terraform に検出させるため)
 

@@ -31,8 +31,9 @@ const powerConvergeTimeout = 5 * time.Minute
 //   - power    (`instancestatus`) : VM の電源状態 (Running / Stopped / 遷移中文字列)
 //
 // これらを Terraform 上でも別フィールドに 1:1 で写し、混同しないようにしている。
-//   - `status`          (Computed)         ← lifecycle (lowercased)
-//   - `instance_status` (Optional+Computed) ← power の正規化値 (running/stopped)
+// 値は enum 的に扱うため UPPER_CASE で正規化する。
+//   - `status`          (Computed)         ← lifecycle (UPPER_CASE: READY / OPEN)
+//   - `instance_status` (Optional+Computed) ← power の正規化値 (RUNNING / STOPPED)
 //   - `status_raw`      (Computed)         ← power の生値 (デバッグ用、遷移中文字列をそのまま見るため)
 func resourceInstance() *schema.Resource {
 	return &schema.Resource{
@@ -66,24 +67,25 @@ func resourceInstance() *schema.Resource {
 				Required: true,
 				ForceNew: true,
 			},
-			// status は API の lifecycle 状態 (READY/OPEN を lowercase 化したもの)。
+			// status は API の lifecycle 状態 (READY/OPEN を UPPER_CASE 化したもの)。
 			"status": {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
-			// instance_status は power 状態。ユーザは running/stopped のみ指定可。
+			// instance_status は power 状態。ユーザは "RUNNING" / "STOPPED" のみ指定可
+			// (StateFunc で UPPER_CASE 化するので tf 側の表記揺れは許容)。
 			// Read 時には API の PowerStatus を normalizePowerStatus で畳んだ値が入る。
 			"instance_status": {
 				Type:     schema.TypeString,
 				Optional: true,
 				Computed: true,
 				StateFunc: func(v any) string {
-					return strings.ToLower(v.(string))
+					return strings.ToUpper(v.(string))
 				},
 				ValidateFunc: func(v any, k string) (ws []string, es []error) {
-					s := strings.ToLower(v.(string))
-					if s != "running" && s != "stopped" {
-						es = append(es, fmt.Errorf("%s must be either \"running\" or \"stopped\"", k))
+					s := strings.ToUpper(v.(string))
+					if s != "RUNNING" && s != "STOPPED" {
+						es = append(es, fmt.Errorf("%s must be either \"RUNNING\" or \"STOPPED\"", k))
 					}
 					return ws, es
 				},
@@ -108,7 +110,7 @@ func resourceInstance() *schema.Resource {
 //  1. createinstance の戻りでは VM はまだ provisioning 中 (lifecycle=READY, power="OS installation In Progress")
 //  2. しばらく経つと lifecycle=OPEN になり、ここで power は **必ず Stopped** で停止状態にされる
 //     (Indigo 側で provision → 一度起動 → 自動停止 の遷移を行うため)
-//  3. ユーザが running を望む場合のみ start を発行する必要がある。stopped は何もしなくてよい
+//  3. ユーザが RUNNING を望む場合のみ start を発行する必要がある。STOPPED は何もしなくてよい
 func resourceInstanceCreate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
@@ -127,11 +129,11 @@ func resourceInstanceCreate(ctx context.Context, d *schema.ResourceData, meta an
 	}
 
 	desired := normalizePowerStatus(d.Get("instance_status").(string))
-	if desired == "running" {
+	if desired == "RUNNING" {
 		if err := c.UpdateInstanceStatus(ctx, id, "start"); err != nil && !isIdempotentStatusUpdateError(err, "start") {
 			return opDiag("indigo_instance", "create", err)
 		}
-		if err := waitForPowerStatus(ctx, c, id, "running", powerConvergeTimeout); err != nil {
+		if err := waitForPowerStatus(ctx, c, id, "RUNNING", powerConvergeTimeout); err != nil {
 			return opDiag("indigo_instance", "create", err)
 		}
 	}
@@ -163,7 +165,7 @@ func resourceInstanceRead(ctx context.Context, d *schema.ResourceData, meta any)
 	}
 
 	_ = d.Set("name", inst.Name)
-	_ = d.Set("status", strings.ToLower(strings.TrimSpace(inst.LifecycleStatus)))
+	_ = d.Set("status", strings.ToUpper(strings.TrimSpace(inst.LifecycleStatus)))
 	_ = d.Set("instance_status", normalizePowerStatus(inst.PowerStatus))
 	_ = d.Set("status_raw", strings.TrimSpace(inst.PowerStatus))
 	_ = d.Set("ipv4", inst.IPv4)
@@ -244,12 +246,12 @@ func resourceInstanceUpdate(ctx context.Context, d *schema.ResourceData, meta an
 
 	var command string
 	switch after {
-	case "running":
+	case "RUNNING":
 		command = "start"
-	case "stopped":
+	case "STOPPED":
 		command = "stop"
 	default:
-		return diag.Errorf("unsupported status %q (allowed: running, stopped)", after)
+		return diag.Errorf("unsupported status %q (allowed: RUNNING, STOPPED)", after)
 	}
 
 	if err := c.UpdateInstanceStatus(ctx, id, command); err != nil {
@@ -284,7 +286,7 @@ func waitForLifecycleOpen(ctx context.Context, c *client.Client, id int, timeout
 }
 
 // waitForPowerStatus は normalizePowerStatus 後の power 状態が want に一致するまで待つ。
-// want は "running" / "stopped" のいずれか。
+// want は "RUNNING" / "STOPPED" のいずれか。
 func waitForPowerStatus(ctx context.Context, c *client.Client, id int, want string, timeout time.Duration) error {
 	return retry.RetryContext(ctx, timeout, func() *retry.RetryError {
 		inst, err := c.GetInstanceByID(ctx, id)
@@ -302,25 +304,25 @@ func waitForPowerStatus(ctx context.Context, c *client.Client, id int, want stri
 }
 
 // normalizePowerStatus は Indigo の PowerStatus (instancestatus) を
-// Terraform 上の正規表現 "running" / "stopped" に畳み込む。
+// Terraform 上の enum 値 "RUNNING" / "STOPPED" に畳み込む。
 //
 // 実 API で観測されたマッピング元値 (case-insensitive):
-//   - "Running" → "running"
-//   - "Stopped" → "stopped"
+//   - "Running" → "RUNNING"
+//   - "Stopped" → "STOPPED"
 //
 // それ以外 (例: "OS installation In Progress" のような遷移中文字列) は
-// 既知の power 状態ではないため、lowercased + trimmed の生値をそのまま返す。
+// 既知の power 状態ではないため、UPPER_CASE + trimmed の値をそのまま返す。
 // これによりユーザは status_raw / instance_status から遷移中であることを観測できる。
 //
 // 注意: lifecycle 値 ("READY" / "OPEN" など) を渡してはいけない。
 // lifecycle と power は別概念であり、本関数は power 専用。
 func normalizePowerStatus(s string) string {
-	v := strings.ToLower(strings.TrimSpace(s))
+	v := strings.ToUpper(strings.TrimSpace(s))
 	switch v {
-	case "running":
-		return "running"
-	case "stopped":
-		return "stopped"
+	case "RUNNING":
+		return "RUNNING"
+	case "STOPPED":
+		return "STOPPED"
 	default:
 		return v
 	}
