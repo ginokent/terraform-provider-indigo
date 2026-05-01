@@ -72,6 +72,10 @@ func (c *Client) token(ctx context.Context) (string, error) {
 	return out.AccessToken, nil
 }
 
+// APIError は Indigo API からの非 2xx レスポンスを表す。
+//
+// Hint はエラーの一次情報ではなく、Indigo 固有の状況 (rate limit / license 失効など) を
+// 検出したとき、上位レイヤがユーザに表示するための追加ガイダンス。errorHint で生成する。
 type APIError struct {
 	StatusCode    int
 	Method        string
@@ -219,6 +223,11 @@ func (c *Client) waitRateLimit(ctx context.Context) error {
 	return nil
 }
 
+// extractAPIErrorMessage は Indigo のエラーレスポンスから人間可読なメッセージを抽出する。
+//
+// Indigo はエンドポイントによって {"message":"..."} / {"error":"..."} /
+// {"errors":[{"detail":"..."}]} / {"validationErrors":{...}} 等まちまちの形でエラーを返すため、
+// 既知のキー名を順に探索し、それでも見つからなければマップ全体を再帰的に走査する。
 func extractAPIErrorMessage(raw []byte) string {
 	if len(raw) == 0 {
 		return ""
@@ -270,6 +279,12 @@ func compactBody(s string, limit int) string {
 	return s[:limit] + "..."
 }
 
+// errorHint は Indigo 特有の状況に対するユーザ向けガイダンスを生成する。
+// 該当しない場合は空文字を返し、上位は通常のエラーメッセージのみを表示する。
+//
+// 扱う case:
+//   - 429: 自動リトライしても解消しない場合は -parallelism を下げる必要があるという周知
+//   - 400 + I10037 / "license failed to update": Indigo 側の契約/ライセンス状態異常 (運用支援が必要)
 func errorHint(status int, message, body string) string {
 	if status == http.StatusTooManyRequests {
 		return "API rate limit exceeded. The provider retries automatically, but consider reducing parallelism (e.g. terraform apply -parallelism=1)."
@@ -384,6 +399,9 @@ func (c *Client) DeleteSSHKey(ctx context.Context, id int) error {
 	return c.do(ctx, http.MethodDelete, fmt.Sprintf("%s/vm/sshkey/%d", c.indigoEndpoint, id), tok, nil, nil)
 }
 
+// decodeSSHKey は Indigo の sshKey フィールドを単体でも配列でも受け付ける。
+// CreateSSHKey は配列、GetSSHKeyByID は単体オブジェクトを返してくる等
+// 同名キーで shape が変わるため、両方試して通った方を採用する。
 func decodeSSHKey(v any) (*SSHKey, error) {
 	if v == nil {
 		return nil, fmt.Errorf("missing sshKey payload")
@@ -476,6 +494,8 @@ func (c *Client) UpdateInstanceStatus(ctx context.Context, id int, status string
 	}
 	return c.do(ctx, http.MethodPost, c.indigoEndpoint+"/vm/instance/statusupdate", tok, map[string]string{"instanceId": strconv.Itoa(id), "status": status}, nil)
 }
+// DeleteInstance は status コマンド destroy で削除を要求する。
+// Indigo には DELETE 専用エンドポイントが存在せず、statusupdate 経由で destroy を投げるのが正攻法。
 func (c *Client) DeleteInstance(ctx context.Context, id int) error {
 	return c.UpdateInstanceStatus(ctx, id, "destroy")
 }
@@ -485,6 +505,12 @@ type InstanceType struct {
 	Name string `json:"name"`
 }
 
+// ListInstanceTypes は instance type 一覧を返す。
+//
+// Indigo の API ドキュメントとデプロイ環境で path / レスポンスキーが揺れているため、
+// endpoint 候補を順に試行し 404 はスキップ、最初に成功したレスポンスを採用する。
+// レスポンスキーも instanceTypes / instancetype / typeList / instancetypelist のいずれかが返るため
+// raw 構造体で全候補を受け取り、非 nil の最初のものを使う。
 func (c *Client) ListInstanceTypes(ctx context.Context) ([]InstanceType, error) {
 	tok, err := c.token(ctx)
 	if err != nil {
@@ -677,6 +703,8 @@ func (c *Client) ListRegions(ctx context.Context, instanceTypeID int) ([]Region,
 	return regions, nil
 }
 
+// decodeInstance は Indigo の vms/instance フィールドを単体でも配列でも受け付ける。
+// CreateInstance のレスポンスは環境によって object / array が揺れるため両方試す。
 func decodeInstance(v any) (*Instance, error) {
 	if v == nil {
 		return nil, fmt.Errorf("missing instance payload")
@@ -720,6 +748,9 @@ func decodeInstanceListFromListResponse(v any) ([]Instance, error) {
 
 	return decodeInstanceList(v)
 }
+// decodeViaMarshal は any (json.Unmarshal で得た map/slice) を out の型に再アサインするためのユーティリティ。
+// Indigo はレスポンス shape が一定でない (key 名/object-array) ため、いったん any で受けてから
+// 候補の Go 型に対し Marshal→Unmarshal を試行する方針を採っている。
 func decodeViaMarshal(in any, out any) error {
 	b, err := json.Marshal(in)
 	if err != nil {
@@ -728,6 +759,13 @@ func decodeViaMarshal(in any, out any) error {
 	return json.Unmarshal(b, out)
 }
 
+// UnmarshalJSON は Indigo の Instance レスポンスを正規化する。
+//
+// 手書きしている理由:
+//   - 電源状態は "instancestatus" (typo されたキー) に入り、API ステータスは "status" に入るが、
+//     environment によって instancestatus が欠落することがあるため Status のフォールバック先として status を使う
+//   - IP は "ipaddress" もしくは "ip" のどちらかで返ってくるため両方を見て、優先順位は ipaddress
+//   - APIStatus は API のレスポンスステータス (例: "Success" / "Failed") を保持するため別フィールドに分けている
 func (i *Instance) UnmarshalJSON(data []byte) error {
 	type apiInstance struct {
 		ID             int    `json:"id"`

@@ -19,22 +19,26 @@ func New() *schema.Provider {
 				Optional:    true,
 				Sensitive:   true,
 				DefaultFunc: schema.EnvDefaultFunc("WEBARENA_INDIGO_API_KEY", nil),
+				Description: "Indigo API key. Falls back to env WEBARENA_INDIGO_API_KEY.",
 			},
 			"api_secret": {
 				Type:        schema.TypeString,
 				Optional:    true,
 				Sensitive:   true,
 				DefaultFunc: schema.EnvDefaultFunc("WEBARENA_INDIGO_API_SECRET", nil),
+				Description: "Indigo API secret. Falls back to env WEBARENA_INDIGO_API_SECRET.",
 			},
 			"oauth_endpoint": {
 				Type:        schema.TypeString,
 				Optional:    true,
 				DefaultFunc: schema.EnvDefaultFunc("WEBARENA_INDIGO_OAUTH_ENDPOINT", nil),
+				Description: "OAuth token endpoint. Defaults to https://api.customer.jp/oauth/v1. Env: WEBARENA_INDIGO_OAUTH_ENDPOINT.",
 			},
 			"indigo_endpoint": {
 				Type:        schema.TypeString,
 				Optional:    true,
 				DefaultFunc: schema.EnvDefaultFunc("WEBARENA_INDIGO_ENDPOINT", nil),
+				Description: "Indigo API base endpoint. Defaults to https://api.customer.jp/webarenaIndigo/v1. Env: WEBARENA_INDIGO_ENDPOINT.",
 			},
 		},
 		ResourcesMap: map[string]*schema.Resource{

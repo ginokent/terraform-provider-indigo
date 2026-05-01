@@ -206,6 +206,28 @@ curl -s -H "Authorization: Bearer $TOKEN" "https://api.customer.jp/webarenaIndig
 #     ...
 #   ]
 # }
+
+# 6) ssh_key_id 取得
+curl -s -H "Authorization: Bearer $TOKEN" "https://api.customer.jp/webarenaIndigo/v1/vm/sshkey" | jq
+# {
+#   "success": true,
+#   "total": 1,
+#  "sshkeys": [
+#    {
+#      "id": ...,
+#      "service_id": ...,
+#      "user_id": ...,
+#      "name": ...,
+#      "sshkey": "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQC...",
+#      "status": "ACTIVE",
+#      "created_at": "2025-05-25 11:26:31",
+#      "updated_at": "2025-05-25 11:26:31"
+#    }
+#  ]
+# }
+
+# 7) vm 一覧取得
+curl -s -H "Authorization: Bearer $TOKEN" "https://api.customer.jp/webarenaIndigo/v1/vm/getinstancelist" | jq
 ```
 
 ## ローカルインストール（`make install`）
@@ -270,7 +292,7 @@ go test ./...
 
 - `examples/ssh-key-vm`: SSH 鍵作成 + VM 作成の一連の Terraform 例
 
-実行例:
+実行例 (`~/.terraformrc` の `filesystem_mirror` 設定済みを前提とする。詳細は次節):
 
 ```bash
 cd examples/ssh-key-vm
@@ -281,16 +303,14 @@ terraform apply
 ```
 
 
-## `terraform init` で provider が見つからない場合
+## `~/.terraformrc` の設定
 
-原因は Terraform の provider 取得モードです。`local/indigo` は未公開 provider なので、`dev_overrides` だけだと `terraform init` 中に registry 問い合わせが走って失敗することがあります。（表示される Warning のとおり、`dev_overrides` 利用時は `init` をスキップする運用が前提です）
-
-`terraform init` も通したい場合は、`~/.terraformrc` を **filesystem_mirror** 方式にしてください。
+未公開 provider のため、Terraform CLI に `local/indigo` の解決方法を教える必要があります。`~/.terraformrc` (環境変数 `TF_CLI_CONFIG_FILE` でも可) に `filesystem_mirror` を設定してください。
 
 ```hcl
 provider_installation {
   filesystem_mirror {
-    path    = "~/.terraform.d/plugins"
+    path    = "<HOME>/.terraform.d/plugins"
     include = ["local/indigo"]
   }
   direct {
@@ -299,16 +319,21 @@ provider_installation {
 }
 ```
 
-その後に再初期化します。
+- `<HOME>` は環境のホームディレクトリ絶対パスに置換 (Terraform CLI configuration は `~` / `$HOME` を展開しない)
+- `path` は `make install` の配置先と同じディレクトリ (`~/.terraform.d/plugins`)。サブディレクトリ `registry.terraform.io/local/indigo/<version>/<os>_<arch>/` 以下に置かれたバイナリが解決される
+- `direct.exclude` で `local/indigo` だけ registry 問い合わせから外す。それ以外の provider は通常通り registry から取得される
+
+`make install` を実行すると **当該環境の絶対パスを埋め込んだ tfrc 例** がメッセージで表示されるので、それをそのまま貼り付けるのが確実です。
+
+### 運用上の注意
+
+- 設定変更後は `.terraform/` と `.terraform.lock.hcl` の不整合で `terraform init` が失敗することがあるため、その場合は削除して再実行する
 
 ```bash
 rm -rf .terraform .terraform.lock.hcl
 terraform init
-terraform providers
+terraform plan
 ```
-
-補足: `dev_overrides` を使う場合は Warning のとおり `terraform init` を省略し、`plan/apply` を直接実行してください。
-
 
 ## API ドキュメント
 

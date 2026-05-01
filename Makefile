@@ -38,7 +38,7 @@ install: deps ## Install the plugin
 	@echo '  }'
 	@echo '}'
 	@echo
-	@echo "For terraform init compatibility, add this to ~/.terraformrc:"
+	@echo "Add this to ~/.terraformrc:"
 	@echo 'provider_installation {'
 	@echo '  filesystem_mirror {'
 	@echo '    path    = "$(HOME)/.terraform.d/plugins"'

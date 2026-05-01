@@ -17,6 +17,14 @@ import (
 	"github.com/ginokent/terraform-provider-indigo/internal/client"
 )
 
+// resourceInstance は indigo_instance を表す。
+//
+// status と instance_status を分離している:
+//   - status は API レスポンスの生 status を小文字化して載せるだけの読み取り専用フィールド
+//   - instance_status は電源状態 (running/stopped) を表すユーザ可変フィールド
+//
+// Indigo API は単一の "status" に電源状態と API 応答ステータスを混在させてくるため、
+// Terraform 上で「ユーザが指示する電源状態」と「API が返す現在状態」を別フィールドに割り当てている。
 func resourceInstance() *schema.Resource {
 	return &schema.Resource{
 		CreateContext: resourceInstanceCreate,
@@ -53,6 +61,8 @@ func resourceInstance() *schema.Resource {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
+			// instance_status は running/stopped のみ受理する。Indigo は他にも多様な
+			// 文字列を返すが、ユーザが指定できるのはこの 2 値に限定する (StateFunc で小文字化)。
 			"instance_status": {
 				Type:     schema.TypeString,
 				Optional: true,
@@ -156,6 +166,9 @@ func resourceInstanceRead(ctx context.Context, d *schema.ResourceData, meta any)
 	return nil
 }
 
+// resourceInstanceDelete は destroy 後にインスタンスが getinstancelist から消えるまで待つ。
+// Indigo の destroy は非同期で、削除 API が成功してもしばらくはリストに残るため、
+// 2 分のタイムアウトでポーリングしている。
 func resourceInstanceDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
@@ -185,6 +198,9 @@ func resourceInstanceDelete(ctx context.Context, d *schema.ResourceData, meta an
 	return nil
 }
 
+// resourceInstanceUpdate は instance_status の差分だけを扱う。
+// 他のフィールド (name/region_id/os_id/plan_id/ssh_key_id) は ForceNew であり、
+// ここに到達した時点で変更されているのは instance_status のみという前提。
 func resourceInstanceUpdate(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
@@ -222,6 +238,14 @@ func resourceInstanceUpdate(ctx context.Context, d *schema.ResourceData, meta an
 	return resourceInstanceRead(ctx, d, meta)
 }
 
+// normalizePowerStatus は Indigo が返す多様な電源状態文字列を running/stopped に畳み込む。
+//
+// マッピング根拠:
+//   - running 系: API が start コマンドを受理した直後に "start"、稼働中は "running"/"active"/"ready" を返す
+//   - stopped 系: 停止指示後に "stop"/"forcestop"、停止確定後は "stopped"、
+//     さらに一部 endpoint では "close"/"closed"/"open" (open は「ポートが開いていない」=停止中の意) を返す
+//
+// 既知マッピング外の値はそのまま小文字化して返し、上位レイヤで気付けるようにする。
 func normalizePowerStatus(s string) string {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "running", "start", "active", "ready":
@@ -233,6 +257,9 @@ func normalizePowerStatus(s string) string {
 	}
 }
 
+// isIdempotentStatusUpdateError は「既に running/stopped」を 400 で返す Indigo の挙動を吸収する。
+// 本来冪等であるべき start/stop が "already running"/"already stopped" 等の 400 を返してくるため、
+// これらは成功扱いに変換しないと running→running の no-op apply が失敗してしまう。
 func isIdempotentStatusUpdateError(err error, command string) bool {
 	var apiErr *client.APIError
 	if !errors.As(err, &apiErr) || apiErr.StatusCode != http.StatusBadRequest {
