@@ -19,15 +19,28 @@ const (
 	defaultIndigoEndpoint = "https://api.customer.jp/webarenaIndigo/v1"
 )
 
+// Client は Indigo API への HTTP クライアント。
+//
+// レート制御は Indigo 独自のレスポンスヘッダ駆動:
+//   - x-quota-allowed   : ウィンドウ内の最大リクエスト数
+//   - x-quota-available : ウィンドウ内の残量
+//   - x-quota-reset     : 次にクォータが復活する時刻 (Unix epoch ms)
+//
+// 静的な minInterval を持たないのは、観測される quota 上限 (例: 6 req/min) が
+// アカウントや時間帯で変動しうるため。実測値で動的にスロットルする方が頑健。
 type Client struct {
 	httpClient     *http.Client
 	oauthEndpoint  string
 	indigoEndpoint string
 	apiKey         string
 	apiSecret      string
-	mu             sync.Mutex
-	lastRequestAt  time.Time
-	minInterval    time.Duration
+
+	// quotaMu は quotaResetAt / quotaAvailable と、それらに従う待機の排他に使う。
+	// ヘッダ観測 / 待機 / 待機後の更新が同一インスタンスの全リクエストで直列化される必要があるため、
+	// httpClient の並列性とは別の mutex として持つ。
+	quotaMu        sync.Mutex
+	quotaResetAt   time.Time // x-quota-reset から観測した次のクォータ復活時刻 (zero = 未観測)
+	quotaAvailable int       // 直近観測した x-quota-available (-1 = 未観測)
 }
 
 type Config struct {
@@ -52,7 +65,7 @@ func New(cfg Config) *Client {
 		indigoEndpoint: indigoEndpoint,
 		apiKey:         cfg.APIKey,
 		apiSecret:      cfg.APISecret,
-		minInterval:    600 * time.Millisecond,
+		quotaAvailable: -1,
 	}
 }
 
@@ -150,6 +163,9 @@ func (c *Client) do(ctx context.Context, method, endpoint, token string, body an
 		if err != nil {
 			return err
 		}
+		// レスポンスヘッダから quota 状態を観測。429 / 成功 / 他エラーすべてで更新する
+		// (Indigo は 2xx レスポンスにも x-quota-* を載せてくるため、予防的スロットルに使える)。
+		c.recordQuota(resp.Header)
 		apiErr := &APIError{
 			StatusCode: resp.StatusCode,
 			Method:     method,
@@ -164,13 +180,25 @@ func (c *Client) do(ctx context.Context, method, endpoint, token string, body an
 			if attempt == maxAttempts-1 {
 				return apiErr
 			}
+			// 待機優先順位: Retry-After (RFC 標準) → x-quota-reset (Indigo 独自) → 線形 fallback。
+			// Indigo は通常 Retry-After を返さず x-quota-reset のみ返すが、将来仕様変更で
+			// Retry-After が来た場合はそちらを尊重する。
 			wait := retryAfter(resp.Header.Get("Retry-After"))
+			if wait <= 0 {
+				if reset := parseQuotaReset(resp.Header.Get("x-quota-reset")); !reset.IsZero() {
+					wait = time.Until(reset) + 50*time.Millisecond
+				}
+			}
 			if wait <= 0 {
 				wait = time.Duration(attempt+1) * time.Second
 			}
 			if err := sleepWithContext(ctx, wait); err != nil {
 				return err
 			}
+			// 待機で quota window の復活を期待しているので、recordQuota が記録した
+			// avail=0/reset=過去 の値はもう古い。クリアしないと次の waitRateLimit が
+			// 同じ reset まで再度待機する二重待機を引き起こす。
+			c.clearQuota()
 			continue
 		}
 		if resp.StatusCode >= 500 {
@@ -196,31 +224,88 @@ func (c *Client) do(ctx context.Context, method, endpoint, token string, body an
 	return fmt.Errorf("request failed")
 }
 
+// waitRateLimit は直近観測した quota 状態に基づいて、必要なら次のクォータ復活時刻まで待機する。
+//
+// 待機条件: x-quota-available が 1 以下 ("0" のとき送れば確実に 429、"1" のときも複数並列で
+// 送れば 429 になる) かつ x-quota-reset が未来。条件を満たせば reset+50ms (jitter) まで sleep する。
+//
+// quotaMu を握ったまま sleep する: そうしないと並列リクエストが quotaAvailable=0 を見て
+// 全部同時に sleep に入り、reset 直後に殺到して再度 429 を踏む thundering-herd になる。
+// quotaMu はクライアント全体のシリアライズではなく、quota 復活待ちのコーディネーションのためのもの。
 func (c *Client) waitRateLimit(ctx context.Context) error {
-	if c.minInterval <= 0 {
+	c.quotaMu.Lock()
+	defer c.quotaMu.Unlock()
+
+	if c.quotaAvailable < 0 || c.quotaAvailable > 1 || c.quotaResetAt.IsZero() {
 		return nil
 	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	now := time.Now()
-	if c.lastRequestAt.IsZero() {
-		c.lastRequestAt = now
-		return nil
-	}
-	next := c.lastRequestAt.Add(c.minInterval)
-	if now.Before(next) {
-		wait := next.Sub(now)
-		timer := time.NewTimer(wait)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-timer.C:
+	wait := time.Until(c.quotaResetAt) + 50*time.Millisecond
+	if wait > 0 {
+		if err := sleepWithContext(ctx, wait); err != nil {
+			return err
 		}
-		now = time.Now()
 	}
-	c.lastRequestAt = now
+	// reset が既に過去 / 待機完了のいずれの場合も、観測値はもう古い。
+	// 次のリクエストの応答で recordQuota が再度埋めるまでクリア。
+	c.clearQuotaLocked()
 	return nil
+}
+
+// clearQuota は観測済みの quota 状態を破棄する。
+// 429 直後の待機で window 復活が期待される場合、過去の avail=0/reset=now+x の値で
+// waitRateLimit が再度同じ wait を引き起こすのを防ぐために呼ぶ。
+func (c *Client) clearQuota() {
+	c.quotaMu.Lock()
+	defer c.quotaMu.Unlock()
+	c.clearQuotaLocked()
+}
+
+// clearQuotaLocked は呼び出し側が quotaMu を保持している前提で観測値を破棄する。
+func (c *Client) clearQuotaLocked() {
+	c.quotaAvailable = -1
+	c.quotaResetAt = time.Time{}
+}
+
+// recordQuota はレスポンスヘッダから観測した quota 状態を保存する。
+// x-quota-available と x-quota-reset の両方が来たときだけ更新する (片方欠ければ無視)。
+func (c *Client) recordQuota(h http.Header) {
+	avail := parseQuotaAvailable(h.Get("x-quota-available"))
+	reset := parseQuotaReset(h.Get("x-quota-reset"))
+	if avail < 0 || reset.IsZero() {
+		return
+	}
+	c.quotaMu.Lock()
+	c.quotaAvailable = avail
+	c.quotaResetAt = reset
+	c.quotaMu.Unlock()
+}
+
+// parseQuotaReset は x-quota-reset (Unix epoch ms 文字列) を time.Time に変換する。
+// 不正値は zero time を返し、呼び出し側で「未観測」として扱える。
+func parseQuotaReset(v string) time.Time {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return time.Time{}
+	}
+	ms, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || ms <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(ms)
+}
+
+// parseQuotaAvailable は x-quota-available を int に変換する。
+// 不正値は -1 を返し、呼び出し側で「未観測」として扱える。
+func parseQuotaAvailable(v string) int {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return -1
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 0 {
+		return -1
+	}
+	return n
 }
 
 // extractAPIErrorMessage は Indigo のエラーレスポンスから人間可読なメッセージを抽出する。
@@ -283,11 +368,12 @@ func compactBody(s string, limit int) string {
 // 該当しない場合は空文字を返し、上位は通常のエラーメッセージのみを表示する。
 //
 // 扱う case:
-//   - 429: 自動リトライしても解消しない場合は -parallelism を下げる必要があるという周知
+//   - 429: クォータウィンドウ内のリクエスト枠を使い切った状況。provider は x-quota-reset まで待ってリトライするが、
+//     リトライ予算 (maxAttempts) を超えても解消しない場合は parallelism を下げるか枠の引き上げが必要
 //   - 400 + I10037 / "license failed to update": Indigo 側の契約/ライセンス状態異常 (運用支援が必要)
 func errorHint(status int, message, body string) string {
 	if status == http.StatusTooManyRequests {
-		return "API rate limit exceeded. The provider retries automatically, but consider reducing parallelism (e.g. terraform apply -parallelism=1)."
+		return "API quota exhausted. The provider waits until the quota window resets (x-quota-reset) before retrying. If this persists, reduce concurrency (e.g. terraform apply -parallelism=1) or contact Indigo support to raise the quota."
 	}
 	if status == http.StatusBadRequest {
 		msg := strings.ToUpper(message + " " + body)

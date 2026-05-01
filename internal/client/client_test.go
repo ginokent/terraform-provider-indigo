@@ -178,7 +178,6 @@ func TestListInstanceTypes_RetryOn429(t *testing.T) {
 	defer s.Close()
 
 	c := New(Config{APIKey: "k", APISecret: "s", OAuthEndpoint: s.URL + "/oauth/v1", IndigoEndpoint: s.URL + "/webarenaIndigo/v1"})
-	c.minInterval = 0
 
 	start := time.Now()
 	types, err := c.ListInstanceTypes(context.Background())
@@ -372,6 +371,199 @@ func TestListOSesAndInstanceSpecs(t *testing.T) {
 	}
 	if len(specs) != 1 || specs[0].ID != 13 {
 		t.Fatalf("unexpected specs list: %#v", specs)
+	}
+}
+
+// TestDo_429_UsesQuotaResetHeader は Indigo 独自の x-quota-reset ヘッダだけが付いた 429 を受けたとき、
+// reset 時刻まで待機して再試行することを確認する (Retry-After は実環境で来ない前提)。
+func TestDo_429_UsesQuotaResetHeader(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth/v1/accesstokens", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": "tok"})
+	})
+	attempt := 0
+	mux.HandleFunc("/webarenaIndigo/v1/vm/instancetypes", func(w http.ResponseWriter, r *http.Request) {
+		attempt++
+		if attempt == 1 {
+			w.Header().Set("x-quota-allowed", "6")
+			w.Header().Set("x-quota-available", "0")
+			w.Header().Set("x-quota-reset", strconv.FormatInt(time.Now().Add(700*time.Millisecond).UnixMilli(), 10))
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "Too Many Request"})
+			return
+		}
+		w.Header().Set("x-quota-allowed", "6")
+		w.Header().Set("x-quota-available", "5")
+		w.Header().Set("x-quota-reset", strconv.FormatInt(time.Now().Add(60*time.Second).UnixMilli(), 10))
+		_ = json.NewEncoder(w).Encode(map[string]any{"instanceTypes": []map[string]any{{"id": 1, "name": "KVM"}}})
+	})
+
+	s := httptest.NewServer(mux)
+	defer s.Close()
+
+	c := New(Config{APIKey: "k", APISecret: "s", OAuthEndpoint: s.URL + "/oauth/v1", IndigoEndpoint: s.URL + "/webarenaIndigo/v1"})
+	start := time.Now()
+	types, err := c.ListInstanceTypes(context.Background())
+	if err != nil {
+		t.Fatalf("ListInstanceTypes failed: %v", err)
+	}
+	if len(types) != 1 {
+		t.Fatalf("unexpected types: %#v", types)
+	}
+	if attempt != 2 {
+		t.Fatalf("expected 2 attempts, got %d", attempt)
+	}
+	// 700ms の x-quota-reset まで待ってから再試行するはず (jitter 50ms 込みで 600ms 以上経過)
+	if elapsed := time.Since(start); elapsed < 600*time.Millisecond {
+		t.Fatalf("expected wait until x-quota-reset, elapsed=%s", elapsed)
+	}
+}
+
+// TestDo_429_PrefersRetryAfterOverQuotaReset は Retry-After と x-quota-reset が同時に来たとき、
+// Retry-After が優先されることを確認する (RFC 標準ヘッダを尊重する方針)。
+func TestDo_429_PrefersRetryAfterOverQuotaReset(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth/v1/accesstokens", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": "tok"})
+	})
+	attempt := 0
+	mux.HandleFunc("/webarenaIndigo/v1/vm/instancetypes", func(w http.ResponseWriter, r *http.Request) {
+		attempt++
+		if attempt == 1 {
+			w.Header().Set("Retry-After", "1")
+			// 5秒先の x-quota-reset。Retry-After が優先されればこちらは無視される。
+			w.Header().Set("x-quota-available", "0")
+			w.Header().Set("x-quota-reset", strconv.FormatInt(time.Now().Add(5*time.Second).UnixMilli(), 10))
+			w.WriteHeader(http.StatusTooManyRequests)
+			_ = json.NewEncoder(w).Encode(map[string]any{"message": "Too Many Request"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"instanceTypes": []map[string]any{{"id": 1, "name": "KVM"}}})
+	})
+
+	s := httptest.NewServer(mux)
+	defer s.Close()
+
+	c := New(Config{APIKey: "k", APISecret: "s", OAuthEndpoint: s.URL + "/oauth/v1", IndigoEndpoint: s.URL + "/webarenaIndigo/v1"})
+	start := time.Now()
+	if _, err := c.ListInstanceTypes(context.Background()); err != nil {
+		t.Fatalf("ListInstanceTypes failed: %v", err)
+	}
+	elapsed := time.Since(start)
+	// Retry-After=1s が効いていれば 1s 〜 2s 程度。x-quota-reset の 5s が誤って効いていれば 5s 以上。
+	if elapsed < 900*time.Millisecond {
+		t.Fatalf("Retry-After=1s should cause >=1s wait, elapsed=%s", elapsed)
+	}
+	// x-quota-reset 待機の影響が残るとここで弾かれる。adaptive 事前スロットルを誤発火させない設計の確認。
+	if elapsed >= 4*time.Second {
+		t.Fatalf("Retry-After should win over x-quota-reset (5s), elapsed=%s", elapsed)
+	}
+}
+
+// TestWaitRateLimit_AdaptivePrefetch は前回レスポンスで x-quota-available=0 を観測したら、
+// 次のリクエスト発射前に x-quota-reset まで待機することを確認する (429 を踏まずに予防する)。
+func TestWaitRateLimit_AdaptivePrefetch(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth/v1/accesstokens", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": "tok"})
+	})
+	mux.HandleFunc("/webarenaIndigo/v1/vm/instancetypes", func(w http.ResponseWriter, r *http.Request) {
+		// 200 だが x-quota-available=0 → 次のリクエストは reset まで待つべき
+		w.Header().Set("x-quota-allowed", "6")
+		w.Header().Set("x-quota-available", "0")
+		w.Header().Set("x-quota-reset", strconv.FormatInt(time.Now().Add(500*time.Millisecond).UnixMilli(), 10))
+		_ = json.NewEncoder(w).Encode(map[string]any{"instanceTypes": []map[string]any{{"id": 1, "name": "KVM"}}})
+	})
+	mux.HandleFunc("/webarenaIndigo/v1/vm/getregion", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-quota-available", "5")
+		w.Header().Set("x-quota-reset", strconv.FormatInt(time.Now().Add(60*time.Second).UnixMilli(), 10))
+		_ = json.NewEncoder(w).Encode(map[string]any{"regionlist": []map[string]any{{"id": 1, "name": "JP"}}})
+	})
+
+	s := httptest.NewServer(mux)
+	defer s.Close()
+
+	c := New(Config{APIKey: "k", APISecret: "s", OAuthEndpoint: s.URL + "/oauth/v1", IndigoEndpoint: s.URL + "/webarenaIndigo/v1"})
+	if _, err := c.ListInstanceTypes(context.Background()); err != nil {
+		t.Fatalf("ListInstanceTypes failed: %v", err)
+	}
+	// この時点で c は x-quota-available=0 / reset=+500ms を覚えている
+	start := time.Now()
+	if _, err := c.ListRegions(context.Background(), 1); err != nil {
+		t.Fatalf("ListRegions failed: %v", err)
+	}
+	elapsed := time.Since(start)
+	// reset まで ~500ms + 50ms jitter 待つはず。誤差を見て 350ms 以上で許容。
+	if elapsed < 350*time.Millisecond {
+		t.Fatalf("expected adaptive prefetch wait (~500ms), elapsed=%s", elapsed)
+	}
+}
+
+// TestWaitRateLimit_AvailablePositive_NoWait は x-quota-available が十分残っていれば
+// 待機せず即発射することを確認する (静的 throttle 撤廃の回帰テスト)。
+func TestWaitRateLimit_AvailablePositive_NoWait(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/oauth/v1/accesstokens", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-quota-available", "5")
+		w.Header().Set("x-quota-reset", strconv.FormatInt(time.Now().Add(60*time.Second).UnixMilli(), 10))
+		_ = json.NewEncoder(w).Encode(map[string]any{"accessToken": "tok"})
+	})
+	mux.HandleFunc("/webarenaIndigo/v1/vm/instancetypes", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("x-quota-available", "5")
+		w.Header().Set("x-quota-reset", strconv.FormatInt(time.Now().Add(60*time.Second).UnixMilli(), 10))
+		_ = json.NewEncoder(w).Encode(map[string]any{"instanceTypes": []map[string]any{{"id": 1, "name": "KVM"}}})
+	})
+	mux.HandleFunc("/webarenaIndigo/v1/vm/getregion", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewEncoder(w).Encode(map[string]any{"regionlist": []map[string]any{{"id": 1, "name": "JP"}}})
+	})
+
+	s := httptest.NewServer(mux)
+	defer s.Close()
+
+	c := New(Config{APIKey: "k", APISecret: "s", OAuthEndpoint: s.URL + "/oauth/v1", IndigoEndpoint: s.URL + "/webarenaIndigo/v1"})
+	if _, err := c.ListInstanceTypes(context.Background()); err != nil {
+		t.Fatalf("ListInstanceTypes failed: %v", err)
+	}
+	start := time.Now()
+	if _, err := c.ListRegions(context.Background(), 1); err != nil {
+		t.Fatalf("ListRegions failed: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 200*time.Millisecond {
+		t.Fatalf("expected no throttle when quota plentiful, elapsed=%s", elapsed)
+	}
+}
+
+func TestParseQuotaReset(t *testing.T) {
+	now := time.Now()
+	got := parseQuotaReset(strconv.FormatInt(now.UnixMilli(), 10))
+	if got.IsZero() {
+		t.Fatalf("expected non-zero time for valid epoch ms")
+	}
+	if d := got.Sub(now); d < -time.Millisecond || d > time.Millisecond {
+		t.Fatalf("parsed time differs from input: %s", d)
+	}
+
+	for _, in := range []string{"", "  ", "abc", "-1", "0"} {
+		if got := parseQuotaReset(in); !got.IsZero() {
+			t.Fatalf("parseQuotaReset(%q) should be zero, got %s", in, got)
+		}
+	}
+}
+
+func TestParseQuotaAvailable(t *testing.T) {
+	cases := map[string]int{
+		"0":   0,
+		"5":   5,
+		"100": 100,
+		"":    -1,
+		"  ":  -1,
+		"abc": -1,
+		"-1":  -1,
+	}
+	for in, want := range cases {
+		if got := parseQuotaAvailable(in); got != want {
+			t.Fatalf("parseQuotaAvailable(%q) = %d, want %d", in, got, want)
+		}
 	}
 }
 
