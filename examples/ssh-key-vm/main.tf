@@ -25,6 +25,7 @@ resource "indigo_instance" "vm" {
   plan_id    = var.plan_id
   ssh_key_id = tonumber(indigo_ssh_key.this.id)
   instance_status = "RUNNING" # "RUNNING" or "STOPPED"
+  stop_before_destroy = true
 
   depends_on = [indigo_ssh_key.this]
 }

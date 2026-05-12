@@ -100,6 +100,26 @@ func resourceInstance() *schema.Resource {
 				Type:     schema.TypeString,
 				Computed: true,
 			},
+			// stop_before_destroy は destroy (および ForceNew による replacement) の前段で
+			// インスタンスを自動的に stop するかどうかを制御する。
+			//
+			// Indigo は RUNNING 状態のインスタンスへの destroy を I10055
+			// ("Instance is in running status. Please stop the instance before destroying.")
+			// で拒否する。毎回手動で stop するのは UX が悪いが、デフォルトで自動停止にすると
+			// 起動中の本番 VM が `terraform destroy` で意図せず止められる事故を招くため、
+			// **明示的な opt-in** とする (デフォルト false)。
+			//
+			// true のとき: Read で PowerStatus を確認し、
+			//   - STOPPED → 何もしない
+			//   - RUNNING → stop コマンド発行 → powerConvergeTimeout (5分) で STOPPED 待ち
+			//   - 遷移中 (例: "OS installation In Progress") → エラー
+			//     (READY 中の VM に stop を投げる挙動は Indigo 側で未定義のため)
+			// その後 destroy へ進む。
+			"stop_before_destroy": {
+				Type:     schema.TypeBool,
+				Optional: true,
+				Default:  false,
+			},
 		},
 	}
 }
@@ -194,6 +214,9 @@ func resourceInstanceRead(ctx context.Context, d *schema.ResourceData, meta any)
 // resourceInstanceDelete は destroy 後にインスタンスが getinstancelist から消えるまで待つ。
 // Indigo の destroy は非同期で、削除 API が成功してもしばらくはリストに残るため、
 // 2 分のタイムアウトでポーリングしている。
+//
+// stop_before_destroy=true のときは、destroy 前に PowerStatus を確認し、RUNNING であれば
+// stop → STOPPED 待機 を挟む (詳細は ensureStoppedForDestroy)。
 func resourceInstanceDelete(ctx context.Context, d *schema.ResourceData, meta any) diag.Diagnostics {
 	c, err := apiClient(meta)
 	if err != nil {
@@ -201,6 +224,13 @@ func resourceInstanceDelete(ctx context.Context, d *schema.ResourceData, meta an
 	}
 
 	id, _ := strconv.Atoi(d.Id())
+
+	if d.Get("stop_before_destroy").(bool) {
+		if err := ensureStoppedForDestroy(ctx, c, id); err != nil {
+			return opDiag("indigo_instance", "delete", err)
+		}
+	}
+
 	if err := c.DeleteInstance(ctx, id); err != nil {
 		return opDiag("indigo_instance", "delete", err)
 	}
@@ -283,6 +313,48 @@ func waitForLifecycleOpen(ctx context.Context, c *client.Client, id int, timeout
 		}
 		return retry.RetryableError(fmt.Errorf("lifecycle status is %q, waiting for OPEN", inst.LifecycleStatus))
 	})
+}
+
+// ensureStoppedForDestroy は destroy 前に PowerStatus を STOPPED に揃える。
+//
+// stop_before_destroy=true のときに resourceInstanceDelete から呼ばれる。Indigo は
+// RUNNING インスタンスへの destroy を I10055 で拒否するため、Terraform 側で先回りして
+// 停止させる必要がある。
+//
+// 分岐:
+//   - インスタンスが既に消えている (Read で nil) → スキップ (out-of-band 削除済み)
+//   - 既に STOPPED → スキップ
+//   - RUNNING → stop コマンド発行 + powerConvergeTimeout (5分) で STOPPED 待ち
+//   - 遷移中文字列 (例: "OS installation In Progress") → エラーで停止
+//
+// 遷移中状態 (主に lifecycle=READY 期間) で stop を投げる挙動は Indigo 側で未定義のため、
+// 自動収束は試みず明確なエラーで呼び出し側に手動収束を促す。ForceNew 経由の中途失敗 create
+// リカバリといった稀ケースのみ到達するパス。
+//
+// isIdempotentStatusUpdateError で「既に stopped」(I10017) は吸収する: Read と stop 発行の
+// 間で out-of-band stop されるレースを許容するため。
+func ensureStoppedForDestroy(ctx context.Context, c *client.Client, id int) error {
+	inst, err := c.GetInstanceByID(ctx, id)
+	if err != nil {
+		return fmt.Errorf("stop before destroy: %w", err)
+	}
+	if inst == nil {
+		return nil
+	}
+	switch normalizePowerStatus(inst.PowerStatus) {
+	case "STOPPED":
+		return nil
+	case "RUNNING":
+		if err := c.UpdateInstanceStatus(ctx, id, "stop"); err != nil && !isIdempotentStatusUpdateError(err, "stop") {
+			return fmt.Errorf("stop before destroy: %w", err)
+		}
+		if err := waitForPowerStatus(ctx, c, id, "STOPPED", powerConvergeTimeout); err != nil {
+			return fmt.Errorf("stop before destroy: %w", err)
+		}
+		return nil
+	default:
+		return fmt.Errorf("stop before destroy: instance is in transient state %q; cannot stop_before_destroy. wait for lifecycle to converge and retry", inst.PowerStatus)
+	}
 }
 
 // waitForPowerStatus は normalizePowerStatus 後の power 状態が want に一致するまで待つ。

@@ -58,7 +58,22 @@ Indigo は create 後に **provisioning → 自動 boot → 自動停止** と�
 - `resourceInstanceUpdate`: start/stop 発行後に `PowerStatus` が desired に収束するまで待つ (5 分)
 - `resourceInstanceRead`: 観測値を **常に** state へ書き戻す。desired を理由に上書きを抑止しない (drift を terraform に検出させるため)
 
-### 5. region_id は API レスポンスに含まれない前提で扱う
+### 5. Destroy 時の事前停止 (`stop_before_destroy`)
+
+Indigo は **RUNNING インスタンスへの destroy を I10055 で拒否する** (`Instance is in running status. Please stop the instance before destroying.`)。これを provider 側で吸収する opt-in フラグを提供する。
+
+- **schema**: `stop_before_destroy` (Bool, Optional, **Default: false**)
+- **デフォルト false である理由**: 「常に自動停止」は便利だが、起動中の本番 VM が `terraform destroy` で意図せず止められる事故を招く。安全側に倒し、明示的に有効化させる
+- **true のとき** (`ensureStoppedForDestroy`):
+  - PowerStatus が `STOPPED` → 何もせず destroy へ進む
+  - PowerStatus が `RUNNING` → `stop` 発行 → `PowerStatus=STOPPED` まで 5 分待ち (`powerConvergeTimeout`) → destroy へ進む。`isIdempotentStatusUpdateError` で「既に stopped」(I10017) は吸収する
+  - PowerStatus が **遷移中文字列** (例: `OS installation In Progress`) → エラーで停止 (READY 中の VM に stop を投げる挙動は Indigo 側で未定義なため、自動収束は試みない)
+- **stop 待機が 5 分で timeout した場合**: destroy は走らず error 終了。VM は中途半端な状態で残るが、次回 `terraform destroy` で自動リトライ可能 (`isIdempotentStatusUpdateError` が「既に stopped」を吸収する)
+- **destroy が中途失敗した場合の drift**: 例えば stop は通ったが getinstancelist ポーリング中に context が切れた場合、state 上 `instance_status` は `RUNNING` のまま残り、次回 plan で `RUNNING → STOPPED` の drift が出ることがある。これは正しい挙動 (Read は API 値を素直に書き戻す方針 — セクション 4 参照)
+- **スコープ外**: lifecycle=READY (provisioning 中) のインスタンスは「transient state」エラーで拒否する。これは ForceNew 経由の中途失敗 create リカバリといった稀ケース。lifecycle が `OPEN` に収束するのを手動で待ってから retry すること
+- **Timeout 設計**: stop 待ち 5 分 + 既存 destroy ポーリング 2 分 = 計 7 分。Terraform SDK v2 の Delete デフォルト 20 分に収まるため、`Timeouts.Delete` は明示設定しない
+
+### 6. region_id は API レスポンスに含まれない前提で扱う
 
 `getinstancelist` 等のレスポンスは `regionname` (文字列) のみを返し、`region_id` (数値) は返さない。Terraform 側では:
 
@@ -66,7 +81,7 @@ Indigo は create 後に **provisioning → 自動 boot → 自動停止** と�
 - `region_id` schema は `Required` + `ForceNew`。create 時にユーザが与えた値が state に保持される
 - `resourceInstanceRead` は `region_id` を API から復元しない (そもそもデータがない)
 
-### 6. 後方互換性は考慮しない
+### 7. 後方互換性は考慮しない
 
 セマンティクスのクリーンさを優先する。fallback / 互換 shim を入れない。
 
